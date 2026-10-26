@@ -75,9 +75,20 @@ export interface CandleStats {
 
 // ------------------------------------------------------- fetch plumbing
 
+// Diagnostics only: HTTP status per provider call, recorded here so
+// /api/weekly can report WHY a feed returned nothing (401 = bad key,
+// 402 = paid endpoint, 403 = plan, 429 = rate limit, timeout, etc).
+// No key, URL, or body is ever recorded — only the status code/label.
+export const feedDiagnostics: Record<string, string> = {};
+
+function recordDiag(label: string, status: string) {
+  feedDiagnostics[label] = status;
+}
+
 async function fetchJson(
   url: string,
   timeoutMs = 8000,
+  label?: string,
 ): Promise<unknown | null> {
   try {
     const controller = new AbortController();
@@ -88,9 +99,11 @@ async function fetchJson(
     } finally {
       clearTimeout(timer);
     }
+    if (label) recordDiag(label, String(res.status));
     if (!res.ok) return null;
     return (await res.json()) as unknown;
   } catch {
+    if (label) recordDiag(label, "timeout-or-network-error");
     return null;
   }
 }
@@ -189,10 +202,18 @@ export async function getSp500Constituents(): Promise<ConstituentsResult> {
   const key = process.env.FMP_KEY;
   if (key) {
     // FMP S&P 500 constituents: [{symbol, name, sector, subSector, ...}]
-    const data = await fetchJson(
+    // Try v3 first, then the newer stable endpoint (same shape, different
+    // plan gating — free keys have been reported 402 on both, hence the
+    // fallback below, but a paid key on either path works).
+    const urls = [
       `https://financialmodelingprep.com/api/v3/sp500_constituent?apikey=${encodeURIComponent(key)}`,
-      10000,
-    );
+      `https://financialmodelingprep.com/stable/sp500-constituent?apikey=${encodeURIComponent(key)}`,
+    ];
+    let data: unknown = null;
+    for (const u of urls) {
+      data = await fetchJson(u, 10000, "fmpConstituentsV3");
+      if (Array.isArray(data) && data.length > 50) break;
+    }
     if (Array.isArray(data) && data.length > 50) {
       const list: Constituent[] = [];
       for (const row of data) {
@@ -225,7 +246,7 @@ export async function getEarningsCalendar(
     // Finnhub: {earningsCalendar: [{date, symbol, epsEstimate, ...}]}
     const data = await fetchJson(
       `https://finnhub.io/api/v1/calendar/earnings?from=${from}&to=${to}&token=${encodeURIComponent(finnhubKey)}`,
-      10000,
+      10000, "finnhubEarnings",
     );
     const rec = asRecord(data);
     const cal = rec ? rec.earningsCalendar : null;
@@ -252,7 +273,7 @@ export async function getEarningsCalendar(
   if (fmpKey) {
     const data = await fetchJson(
       `https://financialmodelingprep.com/api/v3/earning_calendar?from=${from}&to=${to}&apikey=${encodeURIComponent(fmpKey)}`,
-      10000,
+      10000, "fmpEarnings",
     );
     if (Array.isArray(data)) {
       const out: EarningsEvent[] = [];
@@ -282,7 +303,7 @@ export async function getCompanyNews(
   // Finnhub company news: [{headline, summary, source, url, datetime, ...}]
   const data = await fetchJson(
     `https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
-    8000,
+    8000, "finnhubCompanyNews",
   );
   if (!Array.isArray(data)) return [];
   const out: NewsItem[] = [];
@@ -308,7 +329,7 @@ export async function getMarketNews(): Promise<NewsItem[]> {
   // Finnhub general market news: [{headline, summary, source, url, ...}]
   const data = await fetchJson(
     `https://finnhub.io/api/v1/news?category=general&token=${encodeURIComponent(key)}`,
-    8000,
+    8000, "finnhubMarketNews",
   );
   if (!Array.isArray(data)) return [];
   const out: NewsItem[] = [];

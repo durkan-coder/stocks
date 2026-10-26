@@ -4,6 +4,7 @@ import { selectTop50, type CatalystEvent } from "@/lib/weekly";
 import {
   addDays,
   buildCatalystEvents,
+  feedDiagnostics,
   getCompanyNews,
   getEarningsCalendar,
   getMarketNews,
@@ -151,6 +152,10 @@ export async function POST(req: NextRequest) {
     marketNewsItems: marketNews.length,
     companyNewsTickers: companyNewsByTicker.size,
     sentimentTickers: sentimentByTicker.size,
+    // Diagnostics only: HTTP status per provider (no keys, no bodies).
+    // 401 = bad key, 402 = paid endpoint, 403 = plan blocked,
+    // 429 = rate limit, timeout-or-network-error = fetch failed.
+    feedDiagnostics,
     note:
       top50.length === 0
         ? "No verified catalysts in the coming 7 days — no rows written, by design."
