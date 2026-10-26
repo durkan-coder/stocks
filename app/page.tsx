@@ -1,10 +1,28 @@
-// Simple leaderboard page. Fetches /api/leaderboard on load and refreshes
-// every 60 seconds; new scans land every 15 minutes via cron-job.org.
+// Simple leaderboard page. Queries Neon directly instead of fetching
+// /api/leaderboard: a relative fetch fails on the server with
+// "Failed to parse URL from /api/leaderboard" unless a base URL env var
+// is set, which is why the homepage 500s even apart from missing tables.
+// New scans land every 15 minutes via cron-job.org.
+import { neon } from "@neondatabase/serverless";
+
 async function getBoard() {
-  const base = process.env.NEXT_PUBLIC_BASE_URL ?? "";
-  const res = await fetch(`${base}/api/leaderboard`, { cache: "no-store" });
-  if (!res.ok) return { scan: null, rows: [] };
-  return res.json();
+  try {
+    const sql = neon(process.env.DATABASE_URL!);
+    const scans = await sql`SELECT id, scanned_at, market_status FROM scans ORDER BY id DESC LIMIT 1`;
+    if (scans.length === 0) return { scan: null, rows: [] };
+    const scan = scans[0];
+    const rows = await sql`
+      SELECT rank, ticker, company, price, change_1d_pct, change_5d_pct,
+             volume_ratio, score, catalyst, sentiment, reasoning, sources,
+             confidence, target_pct, scanned_at
+      FROM leaderboard
+      WHERE scan_id = ${scan.id}
+      ORDER BY rank ASC
+    `;
+    return { scan, rows };
+  } catch {
+    return { scan: null, rows: [] };
+  }
 }
 
 export default async function Page() {
