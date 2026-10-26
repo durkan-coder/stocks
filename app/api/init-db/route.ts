@@ -11,8 +11,18 @@ export const dynamic = "force-dynamic";
 
 // Each statement is a separate template-literal call: the Neon serverless
 // driver's sql function has no .query() method, so dynamic strings fail
-// type-checking at build time.
-async function createTables(sql: ReturnType<typeof neon>) {
+// type-checking at build time. Statements are inlined in POST (not a
+// helper) because ReturnType<typeof neon> does not match the concrete
+// NeonQueryFunction<false, false> type and breaks the build.
+export async function POST(req: NextRequest) {
+  const secret = process.env.CRON_SECRET;
+  if (secret) {
+    const auth = req.headers.get("authorization") ?? "";
+    if (auth !== `Bearer ${secret}`) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+  }
+  const sql = neon(process.env.DATABASE_URL!);
   await sql`CREATE TABLE IF NOT EXISTS scans (
     id SERIAL PRIMARY KEY,
     scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -70,18 +80,6 @@ async function createTables(sql: ReturnType<typeof neon>) {
   await sql`CREATE INDEX IF NOT EXISTS idx_leaderboard_scanned_at ON leaderboard(scanned_at DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_weekly_score ON weekly_shortlist(week_start DESC, score DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, opened_at DESC)`;
-}
-
-export async function POST(req: NextRequest) {
-  const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const auth = req.headers.get("authorization") ?? "";
-    if (auth !== `Bearer ${secret}`) {
-      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-    }
-  }
-  const sql = neon(process.env.DATABASE_URL!);
-  await createTables(sql);
   return NextResponse.json({ ok: true, tables: ["scans", "leaderboard", "weekly_shortlist", "paper_trades"] });
 }
 
