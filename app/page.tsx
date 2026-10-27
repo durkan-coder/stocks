@@ -164,7 +164,7 @@ export default async function Page() {
 
       <Section title="Paper trades — Alpaca paper only, $100 each">
         {trades.length === 0 ? (
-          <p>No paper trades yet. The weekly /api/trade/weekly job buys the top 3 leaderboard stocks; /api/trade/check closes at +5% or −3%.</p>
+          <p>No paper trades yet. The daily /api/trade/daily job buys one unique leaderboard stock per day, $100 each; /api/trade/check closes at +5% or −3%.</p>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead><tr>

@@ -32,6 +32,12 @@ import { analyzeSentimentBatch, sentimentToScore100 } from "@/lib/openrouter";
 // fake 50: an empty shortlist is correct, and /api/scan will then
 // record an empty scan.
 export const dynamic = "force-dynamic";
+// Weekly rebuild does many provider calls (constituents, earnings,
+// company news for up to 40 tickers, LLM sentiment batches), so give
+// it the same headroom as /api/scan. Without this, Vercel's default
+// function limit can cut the run short and cron-job.org reports a
+// timeout even when some rows were already written.
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   const secret = process.env.CRON_SECRET;
