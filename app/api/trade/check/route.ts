@@ -18,12 +18,33 @@ export async function POST(req: NextRequest) {
   }
 
   const sql = neon(process.env.DATABASE_URL!);
-  const positions = await getPositions();
-  const bySymbol = new Map(positions.map((p: any) => [p.symbol, p]));
 
+  // Check the DB first: with no open trades there is nothing to check,
+  // so do NOT call Alpaca at all. Previously this route called Alpaca
+  // unconditionally, so a bad Alpaca key / Alpaca outage made even an
+  // empty check return 500 instead of a clean "nothing to do".
   const open = await sql`
     SELECT id, ticker FROM paper_trades WHERE status = 'open' ORDER BY opened_at ASC
   `;
+  if (open.length === 0) {
+    return NextResponse.json({ ok: true, closed: [], stillOpen: [], note: "no open paper trades — Alpaca not called" });
+  }
+
+  let positions: any[];
+  try {
+    positions = await getPositions();
+  } catch (e: any) {
+    // Return a JSON error with the Alpaca HTTP status (no key, no body
+    // beyond a truncated message) instead of a bare Next.js 500, so a
+    // cron test run shows WHY it failed.
+    const msg = String(e?.message ?? e);
+    const statusMatch = msg.match(/\((\d{3})\)/);
+    return NextResponse.json(
+      { ok: false, error: "alpaca_positions_failed", alpacaStatus: statusMatch ? Number(statusMatch[1]) : null, detail: msg.slice(0, 300) },
+      { status: 502 },
+    );
+  }
+  const bySymbol = new Map(positions.map((p: any) => [p.symbol, p]));
 
   const closed = [];
   const stillOpen = [];
@@ -40,7 +61,12 @@ export async function POST(req: NextRequest) {
       stillOpen.push({ ticker, plpc });
       continue;
     }
-    await closePosition(ticker);
+    try {
+      await closePosition(ticker);
+    } catch (e: any) {
+      stillOpen.push({ ticker, plpc, note: `close failed: ${String(e?.message ?? e).slice(0, 200)}` });
+      continue;
+    }
     const status = action === "take_profit" ? "closed_take_profit" : "closed_stop_loss";
     await sql`
       UPDATE paper_trades
