@@ -13,6 +13,15 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 //   closed only by /api/trade/check at +5% / -3% (see that route).
 //   If Durkan wants a week-end close as well, that is a separate rule
 //   to add, not a silent default.
+// - Each buy is wrapped in try/catch: previously a single rejected
+//   Alpaca order threw out of the whole route as a bare 500 (this is
+//   what the Monday 2026-10-26 weekly run showed in cron-job.org),
+//   aborting the run and hiding WHY Alpaca rejected it. Now a failed
+//   buy is recorded in results with its Alpaca status/message and the
+//   run continues to the next ticker, returning JSON instead of 500.
+//   NOTE: this route is superseded by /api/trade/daily (one unique
+//   buy per day); it is kept only so an old weekly job still returns
+//   a diagnostic instead of a bare 500. Do not run both jobs.
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
@@ -54,7 +63,20 @@ export async function POST(req: NextRequest) {
       results.push({ ticker, skipped: "already open this week" });
       continue;
     }
-    const order = await placeNotionalBuy(ticker, TRADE_NOTIONAL_USD);
+    let order: any;
+    try {
+      order = await placeNotionalBuy(ticker, TRADE_NOTIONAL_USD);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      const statusMatch = msg.match(/\((\d{3})\)/);
+      results.push({
+        ticker,
+        failed: "alpaca_buy_failed",
+        alpacaStatus: statusMatch ? Number(statusMatch[1]) : null,
+        detail: msg.slice(0, 300),
+      });
+      continue;
+    }
     await sql`
       INSERT INTO paper_trades
         (week_start, ticker, leaderboard_rank, notional_usd, alpaca_order_id, status)
