@@ -14,8 +14,12 @@
 // already needs ~50 quote calls + 1 market-news call. Fetching company
 // news AND candles for all 50 on every tick would be 150+ calls and
 // would 429. So:
-//  - /api/weekly (once a day): constituents + earnings + market news +
-//    company news for earnings tickers only + LLM sentiment in batches.
+//  - /api/weekly (once a day): constituents + earnings + company news
+//    for earnings tickers only + LLM sentiment in batches. General
+//    market news is NOT used as a per-ticker catalyst: mapping one
+//    broad headline to a whole sector (e.g. the same AI headline to
+//    LMT, RTX and AMD) is copy-paste, not company evidence, so it was
+//    removed — see buildCatalystEvents.
 //  - /api/scan (every 15 min): quotes for the shortlist universe ONLY
 //    (never all 500), + 1 market-news call filtered to that universe,
 //    + the named catalyst already stored in weekly_shortlist. Fresh
@@ -515,41 +519,26 @@ function containsAny(text: string, words: string[]): boolean {
   return words.some((w) => t.includes(w));
 }
 
-function sectorTickers(
-  constituents: Constituent[],
-  sectorPart: string,
-  subSectorPart?: string,
-): Constituent[] {
-  return constituents.filter((c) => {
-    const sector = (c.sector ?? "").toLowerCase();
-    const sub = (c.subSector ?? "").toLowerCase();
-    if (!sector.includes(sectorPart.toLowerCase())) return false;
-    if (subSectorPart && !sub.includes(subSectorPart.toLowerCase())) return false;
-    return true;
-  });
-}
-
 /**
- * Build CatalystEvent[] from live feed data. Mapping is by explicit
- * evidence, not by vibe:
+ * Build CatalystEvent[] from live feed data. Every event must be
+ * about THAT ticker — no sector copy-paste:
  * - Earnings: from the earnings calendar, ticker must be a constituent.
  * - Guidance / product / regulatory: from THAT company's own news
  *   (Finnhub company-news), matched on headline keywords.
- * - Macro / geopolitical / sector: from general market news, mapped
- *   ONLY to constituents whose sector/sub-sector matches the theme
- *   (energy for oil, aerospace & defence for war/sanctions, banks for
- *   Fed/rates, semiconductors for chips/AI). A theme with no matching
- *   sector produces no ticker events.
+ * General market news is deliberately NOT mapped here. Previously a
+ * single broad headline (e.g. one AI-market story) was fanned out to
+ * every constituent in a matching sector — the same headline on LMT,
+ * RTX, AMD, etc. — which reads as company news when it is not. A
+ * broad theme is not a per-ticker catalyst, so it produces no events.
  * Events outside the coming 7 days are dropped by the caller (earnings
  * are already windowed; news events are dated today).
  */
 export function buildCatalystEvents(args: {
   constituents: Constituent[];
   earnings: EarningsEvent[];
-  marketNews: NewsItem[];
   companyNewsByTicker: Map<string, NewsItem[]>;
 }): CatalystEvent[] {
-  const { constituents, earnings, marketNews, companyNewsByTicker } = args;
+  const { constituents, earnings, companyNewsByTicker } = args;
   const byTicker = new Map(constituents.map((c) => [c.ticker, c]));
   const events: CatalystEvent[] = [];
   const today = isoDate(new Date());
@@ -591,41 +580,6 @@ export function buildCatalystEvents(args: {
           ticker, company: c.company, type: "regulatory", eventDate: today,
           detail: `Regulatory/legal news: ${item.headline}`,
           impact: 60, certainty: 70, sources: item.source ?? "Finnhub company news",
-        });
-      }
-    }
-  }
-
-  // Broad themes -> sector-matched constituents only.
-  const themes: Array<{
-    keywords: string[];
-    type: CatalystEvent["type"];
-    sectorPart: string;
-    subSectorPart?: string;
-    impact: number;
-    certainty: number;
-    label: string;
-  }> = [
-    { keywords: ["oil", "crude", "opec"], type: "sector", sectorPart: "energy", impact: 60, certainty: 70, label: "Oil/energy" },
-    { keywords: ["war", "sanction", "tariff", "airstrike", "invasion"], type: "geopolitical", sectorPart: "industrials", subSectorPart: "aerospace", impact: 60, certainty: 60, label: "Geopolitical/defence" },
-    { keywords: ["fed", "fomc", "interest rate", "cpi", "inflation", "jobs report", "payrolls"], type: "macro", sectorPart: "financial", impact: 55, certainty: 70, label: "Macro/rates" },
-    { keywords: ["semiconductor", "chip", "ai chip", "gpu"], type: "sector", sectorPart: "information technology", subSectorPart: "semiconductor", impact: 60, certainty: 70, label: "Semiconductors" },
-  ];
-  for (const item of marketNews) {
-    const text = `${item.headline} ${item.summary ?? ""}`;
-    for (const theme of themes) {
-      if (!containsAny(text, theme.keywords)) continue;
-      const matched = sectorTickers(constituents, theme.sectorPart, theme.subSectorPart);
-      for (const c of matched.slice(0, 20)) {
-        events.push({
-          ticker: c.ticker,
-          company: c.company,
-          type: theme.type,
-          eventDate: today,
-          detail: `${theme.label} news: ${item.headline}`,
-          impact: theme.impact,
-          certainty: theme.certainty,
-          sources: item.source ?? "Finnhub market news",
         });
       }
     }

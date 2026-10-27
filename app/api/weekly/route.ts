@@ -7,7 +7,6 @@ import {
   feedDiagnostics,
   getCompanyNews,
   getEarningsCalendar,
-  getMarketNews,
   getSp500Constituents,
   isoDate,
   mapLimit,
@@ -22,8 +21,10 @@ import { analyzeSentimentBatch, sentimentToScore100 } from "@/lib/openrouter";
 // Same CRON_SECRET protection as /api/scan.
 //
 // Real feed (see lib/feed.ts): FMP S&P 500 constituents, Finnhub
-// earnings calendar for the coming 7 days, Finnhub market news, and
-// Finnhub company news for earnings tickers only (rate-limit guard).
+// earnings calendar for the coming 7 days, and Finnhub company news
+// for earnings tickers only (rate-limit guard). General market news
+// is NOT used as a per-ticker catalyst — a broad headline mapped to
+// a whole sector was copy-paste, not company evidence, so it was removed.
 // LLM sentiment (lib/openrouter.ts) is called HERE, once a day, in
 // batches of <=10 tickers — never in the 15-minute scan. Its result is
 // stored in weekly_shortlist.reasoning so /api/scan can reuse it.
@@ -50,7 +51,6 @@ export async function POST(req: NextRequest) {
   const constituentsResult = await getSp500Constituents();
   const constituents = constituentsResult.list;
   const earnings = await getEarningsCalendar(from, to);
-  const marketNews = await getMarketNews();
 
   // Company news only for earnings tickers (bounded, fail-soft).
   // Earnings tickers not in the constituent list are ignored later,
@@ -71,7 +71,6 @@ export async function POST(req: NextRequest) {
   const events: CatalystEvent[] = buildCatalystEvents({
     constituents,
     earnings,
-    marketNews,
     companyNewsByTicker,
   });
   const top50 = selectTop50(events);
@@ -149,7 +148,6 @@ export async function POST(req: NextRequest) {
     constituentsSource: constituentsResult.source,
     constituents: constituents.length,
     earningsInWindow: earnings.length,
-    marketNewsItems: marketNews.length,
     companyNewsTickers: companyNewsByTicker.size,
     sentimentTickers: sentimentByTicker.size,
     // Diagnostics only: HTTP status per provider (no keys, no bodies).
