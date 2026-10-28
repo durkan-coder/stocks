@@ -90,10 +90,30 @@ export async function POST(req: NextRequest) {
     volume_ratio NUMERIC,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`;
+  await sql`CREATE TABLE IF NOT EXISTS pick_outcomes (
+    id SERIAL PRIMARY KEY,
+    scan_date DATE NOT NULL,
+    ticker TEXT NOT NULL,
+    rank INTEGER,
+    score NUMERIC,
+    catalyst_type TEXT,
+    entry_price NUMERIC NOT NULL,
+    outcome_pct NUMERIC,
+    max_pct NUMERIC,
+    hit_5 BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (scan_date, ticker)
+  )`;
+  await sql`CREATE TABLE IF NOT EXISTS macro_events (
+    id SERIAL PRIMARY KEY,
+    event_date DATE NOT NULL,
+    event TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
   await sql`CREATE INDEX IF NOT EXISTS idx_leaderboard_scanned_at ON leaderboard(scanned_at DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_weekly_score ON weekly_shortlist(week_start DESC, score DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, opened_at DESC)`;
-  return NextResponse.json({ ok: true, tables: ["scans", "leaderboard", "weekly_shortlist", "paper_trades", "llm_screen"] });
+  return NextResponse.json({ ok: true, tables: ["scans", "leaderboard", "weekly_shortlist", "paper_trades", "llm_screen", "pick_outcomes", "macro_events"] });
 }
 
 export async function GET(req: NextRequest) {
