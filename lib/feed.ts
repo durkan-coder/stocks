@@ -484,7 +484,27 @@ export async function getCandleStats(symbol: string): Promise<CandleStats | null
  * provider failure or too few sessions — the caller then writes no
  * monthly line, never a fabricated one.
  */
-export async function getMonthlyCandleSummary(symbol: string): Promise<string | null> {
+export interface MonthlyCandleData {
+  summary: string;
+  sessions: number;
+  monthPct: number;
+  // Simple 14-day RSI (average gain / average loss over the last 14
+  // daily changes, not Wilder-smoothed). 0-100, null if too few data.
+  rsi14: number | null;
+  // Historical volatility proxy — NOT options implied volatility, which
+  // the free feeds do not provide. Average and largest absolute daily
+  // % move over the past month, in percent points.
+  avgAbsDailyPct: number;
+  maxAbsDailyPct: number;
+  volumeRatio: number | null;
+  vsAvg20Pct: number | null;
+  belowHighPct: number | null;
+  // Breakout flag: price above its 20-day average AND within 3% of the
+  // month high. A flag, not a prediction.
+  breakout: boolean;
+}
+
+export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandleData | null> {
   const key = process.env.FINNHUB_KEY;
   if (!key) return null;
   const to = Math.floor(Date.now() / 1000);
@@ -503,9 +523,23 @@ export async function getMonthlyCandleSummary(symbol: string): Promise<string | 
   const monthPct = ((last - first) / first) * 100;
   let up = 0;
   let down = 0;
+  const dailyPct: number[] = [];
   for (let i = 1; i < closes.length; i++) {
-    if (closes[i] > closes[i - 1]) up++;
-    else if (closes[i] < closes[i - 1]) down++;
+    const p = ((closes[i] - closes[i - 1]) / closes[i - 1]) * 100;
+    dailyPct.push(p);
+    if (p > 0) up++;
+    else if (p < 0) down++;
+  }
+  const avgAbsDailyPct = dailyPct.reduce((a, p) => a + Math.abs(p), 0) / dailyPct.length;
+  const maxAbsDailyPct = Math.max(...dailyPct.map((p) => Math.abs(p)));
+  let rsi14: number | null = null;
+  const changes = dailyPct.slice(-14);
+  if (changes.length >= 14) {
+    const gains = changes.filter((p) => p > 0);
+    const losses = changes.filter((p) => p < 0).map((p) => -p);
+    const avgGain = gains.reduce((a, b) => a + b, 0) / 14;
+    const avgLoss = losses.reduce((a, b) => a + b, 0) / 14;
+    rsi14 = avgLoss === 0 ? 100 : avgGain === 0 ? 0 : 100 - 100 / (1 + avgGain / avgLoss);
   }
   const last3Pct =
     closes.length >= 4
@@ -519,13 +553,17 @@ export async function getMonthlyCandleSummary(symbol: string): Promise<string | 
     : [];
   const monthHigh = highs.length === closes.length && highs.length > 0 ? Math.max(...highs) : Math.max(...closes);
   const belowHighPct = monthHigh > 0 ? ((last - monthHigh) / monthHigh) * 100 : null;
+  let volumeRatio: number | null = null;
   let volumePart = "";
   if (Array.isArray(r.v) && r.v.length === closes.length) {
     const vols = (r.v as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
     if (vols.length >= 11) {
       const prior = vols.slice(-21, -1);
       const avgVol = prior.reduce((a, b) => a + b, 0) / prior.length;
-      if (avgVol > 0) volumePart = `, volume ${(vols[vols.length - 1] / avgVol).toFixed(1)}x 20-day average`;
+      if (avgVol > 0) {
+        volumeRatio = vols[vols.length - 1] / avgVol;
+        volumePart = `, volume ${volumeRatio.toFixed(1)}x 20-day average`;
+      }
     }
   }
   const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
@@ -534,8 +572,25 @@ export async function getMonthlyCandleSummary(symbol: string): Promise<string | 
     last3Pct !== null ? `last 3 sessions ${fmt(last3Pct)}` : null,
     vsAvg20Pct !== null ? `price ${fmt(vsAvg20Pct)} vs 20-day average` : null,
     belowHighPct !== null ? `${belowHighPct.toFixed(1)}% below month high` : null,
+    rsi14 !== null ? `RSI(14) ${rsi14.toFixed(0)}` : null,
   ].filter((p): p is string => p !== null);
-  return `${parts.join(", ")}${volumePart}.`;
+  return {
+    summary: `${parts.join(", ")}${volumePart}.`,
+    sessions: closes.length,
+    monthPct,
+    rsi14,
+    avgAbsDailyPct,
+    maxAbsDailyPct,
+    volumeRatio,
+    vsAvg20Pct,
+    belowHighPct,
+    breakout: (vsAvg20Pct ?? -999) > 0 && (belowHighPct ?? -999) >= -3,
+  };
+}
+
+export async function getMonthlyCandleSummary(symbol: string): Promise<string | null> {
+  const data = await getMonthlyCandleData(symbol);
+  return data?.summary ?? null;
 }
 
 // -------------------------------------------------------------- sentiment

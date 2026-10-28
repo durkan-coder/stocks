@@ -63,7 +63,18 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades };
+  const screen = await safe(
+    () =>
+      sql`
+        SELECT screen_date, rank, ticker, reason, catalyst_type, event_date,
+               rsi14, month_pct, volume_ratio, created_at
+        FROM llm_screen
+        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM llm_screen)
+        ORDER BY rank ASC LIMIT 5
+      `,
+    [] as AnyRow[],
+  );
+  return { scans, latestScan, board, shortlist, trades, screen };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -136,7 +147,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen } = await getData();
   const openTrades = trades.filter((t) => t.status === "open");
   const newToday = shortlist.filter((s) => s.is_new).length;
   const leaders = sectorLeaders(board);
@@ -187,6 +198,7 @@ export default async function Page() {
           ["Daily shortlist", shortlist.length ? `${shortlist.length} tickers · ${newToday} new · ${fmt(shortlist[0].created_at)}` : "No shortlist yet"],
           ["Paper trades open", String(openTrades.length)],
           ["Sector leaders", `${leaders.size} of 11 sectors`],
+          ["LLM screen", screen.length ? `${screen.length} setups · ${fmt(screen[0].created_at)}` : "No screen yet"],
           ["Scans shown", String(scans.length ? `${scans.length} (latest 10)` : "0")],
         ].map(([label, value]) => (
           <div key={label} className="status-card">
@@ -256,6 +268,33 @@ export default async function Page() {
                 </div>
               );
             })}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>LLM screen — top setups to watch</h2>
+        <p className="section-note">
+          Our LLM (OpenRouter free model, not Gemini) ranks up to 5 candidates from the daily shortlist, using only verified data: upcoming catalyst, RSI(14), month trend, volume and historical volatility. Research screen only — not a prediction, not a buy recommendation, and it does not change leaderboard scores or paper trades.
+        </p>
+        {screen.length === 0 ? (
+          <p>No LLM screen yet. It is written by the daily /api/weekly rebuild, and is empty if that run&apos;s LLM call failed — never a fabricated list.</p>
+        ) : (
+          <div className="cards">
+            {screen.map((s: any) => (
+              <div key={s.ticker} className="row-card">
+                <div className="row-top">
+                  <div>
+                    <div className="ticker">#{s.rank} {s.ticker}</div>
+                    <div className="company">{s.catalyst_type ?? ""}{s.event_date ? ` · Event ${fmt(s.event_date)}` : ""}</div>
+                  </div>
+                </div>
+                <div className="detail">{s.reason}</div>
+                <div className="meta">
+                  RSI(14) {s.rsi14 ?? "—"} · Month {s.month_pct ?? "—"}% · Volume {s.volume_ratio ?? "—"}x avg
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>

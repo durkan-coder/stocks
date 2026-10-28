@@ -7,13 +7,14 @@ import {
   feedDiagnostics,
   getCompanyNews,
   getEarningsCalendar,
-  getMonthlyCandleSummary,
+  getMonthlyCandleData,
   getSp500Constituents,
+  type MonthlyCandleData,
   isoDate,
   mapLimit,
   type NewsItem,
 } from "@/lib/feed";
-import { analyzeSentimentBatch, sentimentToScore100 } from "@/lib/openrouter";
+import { analyzeSentimentBatch, screenSetups, sentimentToScore100 } from "@/lib/openrouter";
 
 // Stage 1, run EVERY DAY via cron-job.org (e.g. pre-market ET).
 // The 1-week horizon stays the same — the event must be within the
@@ -135,20 +136,51 @@ export async function POST(req: NextRequest) {
   // no candle data simply gets no monthly line. This does NOT
   // change any score — technical/volume/catalyst/sentiment are
   // computed exactly as before in /api/scan.
-  const monthlyByTicker = new Map<string, string>();
+  const monthlyByTicker = new Map<string, MonthlyCandleData>();
   if (top50.length > 0) {
     const monthlyPairs = await mapLimit(top50, 8, async (e) => ({
       ticker: e.ticker,
-      summary: await getMonthlyCandleSummary(e.ticker),
+      data: await getMonthlyCandleData(e.ticker),
     }));
     for (const pair of monthlyPairs) {
-      if (pair.summary) monthlyByTicker.set(pair.ticker, pair.summary);
+      if (pair.data) monthlyByTicker.set(pair.ticker, pair.data);
     }
+  }
+
+  // LLM screen (our LLM, OpenRouter free model — not Gemini): one call
+  // over the top 15 shortlist candidates, grounded in verified data
+  // only (catalyst, RSI, month trend, volume, historical volatility,
+  // headlines, stored sentiment). Returns up to 5 picks with reasons,
+  // or [] on any failure. Research ranking only: it does NOT change
+  // leaderboard scores, shortlist scores, or paper trades.
+  let llmScreen: Array<{ ticker: string; reason: string }> = [];
+  try {
+    const candidates = top50.slice(0, 15).map((e) => {
+      const m = monthlyByTicker.get(e.ticker);
+      const s = sentimentByTicker.get(e.ticker);
+      return {
+        ticker: e.ticker,
+        catalystType: e.type,
+        eventDate: e.eventDate,
+        eventDetail: e.detail,
+        shortlistScore: e.score,
+        rsi14: m?.rsi14 ?? null,
+        monthPct: m?.monthPct ?? null,
+        volumeRatio: m?.volumeRatio ?? null,
+        avgAbsDailyPct: m?.avgAbsDailyPct ?? null,
+        breakout: m?.breakout ?? false,
+        sentimentLabel: s?.label ?? "neutral",
+        headlines: (companyNewsByTicker.get(e.ticker) ?? []).slice(0, 2).map((n) => n.headline),
+      };
+    });
+    llmScreen = await screenSetups(candidates);
+  } catch {
+    llmScreen = [];
   }
 
   for (const e of top50) {
     const llm = sentimentByTicker.get(e.ticker);
-    const monthly = monthlyByTicker.get(e.ticker);
+    const monthly = monthlyByTicker.get(e.ticker)?.summary;
     // event_detail stays the raw catalyst; reasoning carries it plus
     // the monthly candle summary and the stored LLM sentiment, which
     // /api/scan parses back out (LLM regex) and displays as-is.
@@ -173,6 +205,45 @@ export async function POST(req: NextRequest) {
     `;
   }
 
+  // Store today's LLM screen, replacing any earlier screen from the
+  // same calendar day (weekly rebuilds are daily, one screen per day).
+  // Table is created here if missing, so no manual Neon SQL is needed;
+  // /api/init-db creates the same table for completeness.
+  try {
+    await sql`CREATE TABLE IF NOT EXISTS llm_screen (
+      id SERIAL PRIMARY KEY,
+      screen_date DATE NOT NULL,
+      rank INTEGER NOT NULL,
+      ticker TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      catalyst_type TEXT,
+      event_date DATE,
+      rsi14 NUMERIC,
+      month_pct NUMERIC,
+      volume_ratio NUMERIC,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`;
+    await sql`DELETE FROM llm_screen WHERE DATE(created_at) = CURRENT_DATE`;
+    for (let i = 0; i < llmScreen.length; i++) {
+      const pick = llmScreen[i];
+      const e = top50.find((x) => x.ticker === pick.ticker);
+      const m = monthlyByTicker.get(pick.ticker);
+      await sql`
+        INSERT INTO llm_screen
+          (screen_date, rank, ticker, reason, catalyst_type, event_date, rsi14, month_pct, volume_ratio)
+        VALUES (
+          ${now.toISOString().slice(0, 10)}, ${i + 1}, ${pick.ticker}, ${pick.reason},
+          ${e?.type ?? null}, ${e?.eventDate ?? null},
+          ${m?.rsi14 ?? null}, ${m?.monthPct ?? null}, ${m?.volumeRatio ?? null}
+        )
+      `;
+    }
+  } catch {
+    // Screen storage failure must not fail the whole weekly rebuild;
+    // the shortlist above is already written. An empty screen is shown.
+    llmScreen = [];
+  }
+
   return NextResponse.json({
     ok: true,
     weekStart,
@@ -185,6 +256,8 @@ export async function POST(req: NextRequest) {
     companyNewsTickers: companyNewsByTicker.size,
     sentimentTickers: sentimentByTicker.size,
     monthlyCandleTickers: monthlyByTicker.size,
+    llmScreenTickers: llmScreen.length,
+    llmScreen,
     // Diagnostics only: HTTP status per provider (no keys, no bodies).
     // 401 = bad key, 402 = paid endpoint, 403 = plan blocked,
     // 429 = rate limit, timeout-or-network-error = fetch failed.
