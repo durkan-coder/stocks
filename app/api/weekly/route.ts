@@ -17,6 +17,7 @@ import {
   type NewsItem,
 } from "@/lib/feed";
 import { analyzeSentimentBatch, screenSetups, sentimentToScore100 } from "@/lib/openrouter";
+import { getTradierExpectedMove, type TradierExpectedMove } from "@/lib/tradier";
 
 // Stage 1, run EVERY DAY via cron-job.org (e.g. pre-market ET).
 // The 1-week horizon stays the same — the event must be within the
@@ -212,6 +213,28 @@ export async function POST(req: NextRequest) {
   }
   top50.sort((a, b) => b.score - a.score);
 
+  // Tradier sandbox expected move, earnings tickers only (the ones
+  // where an options-implied move matters most), spot = prior close
+  // from monthly candles. 2 Tradier calls per ticker, concurrency 5,
+  // fail-soft per ticker. No token -> skipped silently, with a count
+  // of 0 in the response. Reasoning-only: stored in reasoning and
+  // passed to the LLM screen, no score change in v1.
+  const tradierByTicker = new Map<string, TradierExpectedMove>();
+  if (process.env.TRADIER_TOKEN) {
+    try {
+      const tradierTop = top50.filter((e) => e.type === "earnings");
+      const tradierPairs = await mapLimit(tradierTop, 5, async (e) => ({
+        ticker: e.ticker,
+        move: await getTradierExpectedMove(e.ticker, monthlyByTicker.get(e.ticker)?.lastClose ?? 0),
+      }));
+      for (const pair of tradierPairs) {
+        if (pair.move) tradierByTicker.set(pair.ticker, pair.move);
+      }
+    } catch {
+      // Tradier failure -> no expected move lines, never a fake one.
+    }
+  }
+
   // Macro events this week (dashboard note only, not a per-ticker catalyst).
   let macroEvents: Array<{ date: string; event: string }> = [];
   try {
@@ -242,6 +265,7 @@ export async function POST(req: NextRequest) {
         volumeRatio: m?.volumeRatio ?? null,
         avgAbsDailyPct: m?.avgAbsDailyPct ?? null,
         breakout: m?.breakout ?? false,
+        expectedMovePct: tradierByTicker.get(e.ticker)?.expectedMovePct ?? null,
         sentimentLabel: s?.label ?? "neutral",
         headlines: (companyNewsByTicker.get(e.ticker) ?? []).slice(0, 2).map((n) => n.headline),
       };
@@ -261,6 +285,9 @@ export async function POST(req: NextRequest) {
       ADD COLUMN IF NOT EXISTS avg_abs_daily_pct NUMERIC,
       ADD COLUMN IF NOT EXISTS change_5d_pct NUMERIC,
       ADD COLUMN IF NOT EXISTS sector_rel_pct NUMERIC,
+      ADD COLUMN IF NOT EXISTS expected_move_pct NUMERIC,
+      ADD COLUMN IF NOT EXISTS expected_move_expiry DATE,
+      ADD COLUMN IF NOT EXISTS expected_move_iv NUMERIC,
       ADD COLUMN IF NOT EXISTS earnings_beats INTEGER,
       ADD COLUMN IF NOT EXISTS earnings_total INTEGER,
       ADD COLUMN IF NOT EXISTS avg_surprise_pct NUMERIC`;
@@ -275,6 +302,7 @@ export async function POST(req: NextRequest) {
     const m = monthlyByTicker.get(e.ticker);
     const hist = earningsHistoryByTicker.get(e.ticker);
     const sectorRel = sectorRelByTicker.get(e.ticker);
+    const tradier = tradierByTicker.get(e.ticker);
     // event_detail stays the raw catalyst; reasoning carries it plus
     // the monthly candle summary, earnings history, sector-relative
     // move, and the stored LLM sentiment, which /api/scan parses
@@ -284,6 +312,7 @@ export async function POST(req: NextRequest) {
       m?.summary ?? null,
       hist?.summary ?? null,
       sectorRel !== undefined ? `vs sector: ${sectorRel >= 0 ? "+" : ""}${sectorRel.toFixed(1)}% this month.` : null,
+      tradier ? `Options (Tradier sandbox): expected move ±${tradier.expectedMovePct.toFixed(1)}% by ${tradier.expiry}${tradier.iv !== null ? `, IV ${tradier.iv.toFixed(1)}%` : ""}.` : null,
       llm
         ? `Sentiment (LLM): ${llm.label}, ${((llm.score100 - 50) / 50).toFixed(2)} — ${llm.reason}`
         : null,
@@ -295,14 +324,16 @@ export async function POST(req: NextRequest) {
         (week_start, ticker, company, catalyst_type, event_date,
          event_detail, reasoning, score, sources, is_new,
          rsi14, month_pct, volume_ratio, avg_abs_daily_pct, change_5d_pct,
-         sector_rel_pct, earnings_beats, earnings_total, avg_surprise_pct)
+         sector_rel_pct, expected_move_pct, expected_move_expiry, expected_move_iv,
+         earnings_beats, earnings_total, avg_surprise_pct)
       VALUES (
         ${weekStart}, ${e.ticker}, ${e.company ?? null}, ${e.type},
         ${e.eventDate ?? null}, ${e.detail}, ${reasoning}, ${e.score},
         ${e.sources ?? null}, ${!previous.has(e.ticker)},
         ${m?.rsi14 ?? null}, ${m?.monthPct ?? null}, ${m?.volumeRatio ?? null},
         ${m?.avgAbsDailyPct ?? null}, ${m?.change5dPct ?? null},
-        ${sectorRel ?? null}, ${hist?.beats ?? null}, ${hist?.total ?? null},
+        ${sectorRel ?? null}, ${tradier?.expectedMovePct ?? null}, ${tradier?.expiry ?? null},
+        ${tradier?.iv ?? null}, ${hist?.beats ?? null}, ${hist?.total ?? null},
         ${hist?.avgSurprisePct ?? null}
       )
     `;
@@ -376,6 +407,8 @@ export async function POST(req: NextRequest) {
     sentimentTickers: sentimentByTicker.size,
     monthlyCandleTickers: monthlyByTicker.size,
     earningsHistoryTickers: earningsHistoryByTicker.size,
+    tradierTickers: tradierByTicker.size,
+    tradierTokenSet: Boolean(process.env.TRADIER_TOKEN),
     sectorEtfTickers: sectorMonthByEtf.size,
     macroEvents: macroEvents.length,
     llmScreenTickers: llmScreen.length,

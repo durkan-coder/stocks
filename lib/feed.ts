@@ -487,6 +487,7 @@ export async function getCandleStats(symbol: string): Promise<CandleStats | null
 export interface MonthlyCandleData {
   summary: string;
   sessions: number;
+  lastClose: number;
   monthPct: number;
   change5dPct: number | null;
   // Simple 14-day RSI (average gain / average loss over the last 14
@@ -582,6 +583,7 @@ export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandl
   return {
     summary: `${parts.join(", ")}${volumePart}.`,
     sessions: closes.length,
+    lastClose: last,
     monthPct,
     change5dPct,
     rsi14,
