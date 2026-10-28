@@ -77,10 +77,23 @@ export async function POST(req: NextRequest) {
     opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at TIMESTAMPTZ
   )`;
+  await sql`CREATE TABLE IF NOT EXISTS llm_screen (
+    id SERIAL PRIMARY KEY,
+    screen_date DATE NOT NULL,
+    rank INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    catalyst_type TEXT,
+    event_date DATE,
+    rsi14 NUMERIC,
+    month_pct NUMERIC,
+    volume_ratio NUMERIC,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
   await sql`CREATE INDEX IF NOT EXISTS idx_leaderboard_scanned_at ON leaderboard(scanned_at DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_weekly_score ON weekly_shortlist(week_start DESC, score DESC)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, opened_at DESC)`;
-  return NextResponse.json({ ok: true, tables: ["scans", "leaderboard", "weekly_shortlist", "paper_trades"] });
+  return NextResponse.json({ ok: true, tables: ["scans", "leaderboard", "weekly_shortlist", "paper_trades", "llm_screen"] });
 }
 
 export async function GET(req: NextRequest) {
