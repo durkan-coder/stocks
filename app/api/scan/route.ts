@@ -51,6 +51,14 @@ interface ShortlistRow {
   event_detail: string;
   reasoning: string;
   score: number;
+  // Numeric weekly candle/sector data, when the latest shortlist was
+  // built by the new weekly code. Older rows have nulls, and the
+  // scoring below falls back to the old neutral values.
+  rsi14?: number | null;
+  month_pct?: number | null;
+  volume_ratio?: number | null;
+  change_5d_pct?: number | null;
+  sector_rel_pct?: number | null;
 }
 
 export async function POST(req: NextRequest) {
@@ -79,12 +87,26 @@ export async function POST(req: NextRequest) {
     mode = "on_demand";
   } else {
     try {
-      const shortlist = await sql`
-        SELECT ticker, company, catalyst_type, event_detail, reasoning, score
-        FROM weekly_shortlist
-        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM weekly_shortlist)
-        ORDER BY score DESC LIMIT 50
-      `;
+      // New columns (rsi14, month_pct, ...) exist only after a weekly
+      // rebuild that ran ALTER TABLE. Until then, fall back to the
+      // old column list so scans keep working instead of emptying.
+      let shortlist: unknown[];
+      try {
+        shortlist = await sql`
+          SELECT ticker, company, catalyst_type, event_detail, reasoning, score,
+                 rsi14, month_pct, volume_ratio, change_5d_pct, sector_rel_pct
+          FROM weekly_shortlist
+          WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM weekly_shortlist)
+          ORDER BY score DESC LIMIT 50
+        `;
+      } catch {
+        shortlist = await sql`
+          SELECT ticker, company, catalyst_type, event_detail, reasoning, score
+          FROM weekly_shortlist
+          WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM weekly_shortlist)
+          ORDER BY score DESC LIMIT 50
+        `;
+      }
       for (const row of shortlist as unknown as ShortlistRow[]) {
         shortlistByTicker.set(row.ticker, row);
       }
@@ -205,12 +227,23 @@ export async function POST(req: NextRequest) {
     }
     if (mode === "on_demand") headlines.push(...onDemandNewsHeadlines);
 
-    // Technical: 1-day % change mapped 50 +/- 10 per point, clamped.
+    // Technical, now real multi-day data when the latest shortlist
+    // carries it (from tomorrow's weekly rebuild onward):
+    // 50% 1-day move + 30% month move + 20% RSI score (RSI near 60 is
+    // strongest; very overbought/oversold are penalised). Without
+    // monthly data, falls back to the old 1-day-only formula.
     const change1dPct = quote.changePct;
-    const technical =
-      change1dPct === undefined
-        ? 50
-        : Math.max(0, Math.min(100, 50 + change1dPct * 10));
+    const clamp = (v: number) => Math.max(0, Math.min(100, v));
+    const technical1d =
+      change1dPct === undefined ? 50 : clamp(50 + change1dPct * 10);
+    let technical = technical1d;
+    const m = mode === "on_demand" ? null : shortlist;
+    if (m && m.month_pct !== null && m.month_pct !== undefined) {
+      const technicalMonth = clamp(50 + Number(m.month_pct) * 3);
+      const rsi = m.rsi14 !== null && m.rsi14 !== undefined ? Number(m.rsi14) : null;
+      const rsiScore = rsi === null ? 50 : clamp(100 - Math.abs(rsi - 60) * 1.5);
+      technical = 0.5 * technical1d + 0.3 * technicalMonth + 0.2 * rsiScore;
+    }
 
     // Sentiment: stored LLM sentiment first, else rule-based headlines.
     const storedLlm = parseStoredLlmSentiment(catalystRow.reasoning);
@@ -227,39 +260,72 @@ export async function POST(req: NextRequest) {
         sentiment >= 65 ? "positive" : sentiment <= 35 ? "negative" : "neutral";
     }
 
-    // Sector: raised only when sector news matches the ticker's sector.
+    // Sector: real relative strength when the shortlist carries it
+    // (ticker month % minus its sector ETF month %), otherwise the
+    // old keyword bump, otherwise neutral 50.
     let sector = 50;
-    const sectorName = (constituent?.sector ?? "").toLowerCase();
-    if (sectorName) {
-      const sectorKeywords: Record<string, string[]> = {
-        energy: ["oil", "crude", "opec", "energy"],
-        financial: ["fed", "fomc", "interest rate", "bank"],
-        "information technology": ["semiconductor", "chip", "ai"],
-      };
-      for (const [sectorKey, words] of Object.entries(sectorKeywords)) {
-        if (!sectorName.includes(sectorKey)) continue;
-        if (headlines.some((h) => words.some((w) => h.toLowerCase().includes(w)))) {
-          sector = 65;
+    const sectorRel = m?.sector_rel_pct;
+    if (sectorRel !== null && sectorRel !== undefined) {
+      sector = clamp(50 + Number(sectorRel) * 5);
+    } else {
+      const sectorName = (constituent?.sector ?? "").toLowerCase();
+      if (sectorName) {
+        const sectorKeywords: Record<string, string[]> = {
+          energy: ["oil", "crude", "opec", "energy"],
+          financial: ["fed", "fomc", "interest rate", "bank"],
+          "information technology": ["semiconductor", "chip", "ai"],
+        };
+        for (const [sectorKey, words] of Object.entries(sectorKeywords)) {
+          if (!sectorName.includes(sectorKey)) continue;
+          if (headlines.some((h) => words.some((w) => h.toLowerCase().includes(w)))) {
+            sector = 65;
+          }
         }
       }
     }
+
+    // Volume: real ratio from weekly candles when available, else
+    // on-demand candle ratio, else neutral 50 (never invented).
+    const volumeRatioRaw =
+      m?.volume_ratio !== null && m?.volume_ratio !== undefined
+        ? Number(m.volume_ratio)
+        : mode === "on_demand"
+          ? onDemandCandle?.volumeRatio
+          : undefined;
+    const volume =
+      volumeRatioRaw === undefined
+        ? 50
+        : volumeRatioRaw >= 1.5
+          ? 85
+          : volumeRatioRaw >= 1.2
+            ? 75
+            : volumeRatioRaw >= 1.0
+              ? 65
+              : volumeRatioRaw >= 0.8
+                ? 50
+                : volumeRatioRaw >= 0.5
+                  ? 35
+                  : 20;
 
     candidates.push({
       ticker,
       technical,
       catalyst: catalystRow.score,
       sentiment,
-      // Volume: neutral unless on-demand candles gave a real ratio.
-      // The quote-only path has no volume ratio, so we do not invent one.
-      volume: 50,
+      volume,
       sector,
       reasoning: catalystRow.reasoning,
       catalystLabel: `${catalystRow.catalyst_type}: ${catalystRow.event_detail}`,
       sentimentLabel,
       price: quote.price,
       change1dPct,
-      change5dPct: mode === "on_demand" ? onDemandCandle?.change5dPct : undefined,
-      volumeRatio: mode === "on_demand" ? onDemandCandle?.volumeRatio : undefined,
+      change5dPct:
+        mode === "on_demand"
+          ? onDemandCandle?.change5dPct
+          : m?.change_5d_pct !== null && m?.change_5d_pct !== undefined
+            ? Number(m.change_5d_pct)
+            : undefined,
+      volumeRatio: volumeRatioRaw,
       company,
       sources: `Quote: ${quote.source}; catalyst: weekly_shortlist`,
     });

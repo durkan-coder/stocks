@@ -74,7 +74,36 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen };
+  const backtestAgg = await safe(
+    () =>
+      sql`
+        SELECT COUNT(*)::int AS total,
+               COALESCE(SUM(CASE WHEN hit_5 THEN 1 ELSE 0 END), 0)::int AS hits,
+               COALESCE(AVG(outcome_pct), 0) AS avg_outcome,
+               COALESCE(AVG(max_pct), 0) AS avg_max
+        FROM pick_outcomes
+      `,
+    [] as AnyRow[],
+  );
+  const backtestRecent = await safe(
+    () =>
+      sql`
+        SELECT scan_date, ticker, rank, score, entry_price, outcome_pct, max_pct, hit_5
+        FROM pick_outcomes ORDER BY scan_date DESC, rank ASC LIMIT 20
+      `,
+    [] as AnyRow[],
+  );
+  const macro = await safe(
+    () =>
+      sql`
+        SELECT event_date, event, created_at
+        FROM macro_events
+        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM macro_events)
+        ORDER BY event_date ASC LIMIT 20
+      `,
+    [] as AnyRow[],
+  );
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -147,7 +176,10 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro } = await getData();
+  const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
+  const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
+  const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
   const openTrades = trades.filter((t) => t.status === "open");
   const newToday = shortlist.filter((s) => s.is_new).length;
   const leaders = sectorLeaders(board);
@@ -199,6 +231,7 @@ export default async function Page() {
           ["Paper trades open", String(openTrades.length)],
           ["Sector leaders", `${leaders.size} of 11 sectors`],
           ["LLM screen", screen.length ? `${screen.length} setups · ${fmt(screen[0].created_at)}` : "No screen yet"],
+          ["Backtest hit rate", backtestRate !== null ? `${backtestRate.toFixed(1)}% (${backtestHits}/${backtestTotal})` : "No 7-day outcomes yet"],
           ["Scans shown", String(scans.length ? `${scans.length} (latest 10)` : "0")],
         ].map(([label, value]) => (
           <div key={label} className="status-card">
@@ -346,6 +379,62 @@ export default async function Page() {
             ))}
           </div>
         )}
+      </section>
+
+      <section className="section">
+        <h2>Backtest — 7-day outcomes</h2>
+        <p className="section-note">
+          For each pick, did it reach +5% within 7 days (daily high vs entry price)? Written daily by /api/backtest for picks from 7 days ago. First outcomes land Nov 2, since scans began Oct 26 — until then this section is honestly empty, not a fabricated hit rate.
+        </p>
+        {backtestTotal === 0 ? (
+          <p>No 7-day outcomes yet.</p>
+        ) : (
+          <>
+            <p style={{ fontSize: 15 }}>
+              Hit rate: <strong>{backtestRate?.toFixed(1)}%</strong> ({backtestHits}/{backtestTotal} picks) ·
+              Avg outcome {Number(backtestAgg.avg_outcome).toFixed(1)}% · Avg max rise {Number(backtestAgg.avg_max).toFixed(1)}%
+            </p>
+            <div className="cards">
+              {backtestRecent.map((o: any, i: number) => (
+                <div key={`${o.scan_date}-${o.ticker}-${i}`} className="row-card">
+                  <div className="row-top">
+                    <div>
+                      <div className="ticker">{o.ticker}</div>
+                      <div className="company">Pick {fmt(o.scan_date)} · Rank {o.rank} · Score {o.score}</div>
+                    </div>
+                    <div className="badge" style={{ color: o.hit_5 ? "#137333" : "#5f6368" }}>{o.hit_5 ? "HIT +5%" : "miss"}</div>
+                  </div>
+                  <div className="meta">Entry {o.entry_price} · 7-day close {Number(o.outcome_pct).toFixed(1)}% · Max rise {Number(o.max_pct).toFixed(1)}%</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Macro this week</h2>
+        <p className="section-note">Major US macro events in the coming 7 days (CPI, Fed/FOMC, jobs, GDP, retail). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst.</p>
+        {macro.length === 0 ? (
+          <p>No major macro events found for this week, or the weekly macro fetch failed.</p>
+        ) : (
+          <div className="cards">
+            {macro.map((ev: any, i: number) => (
+              <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
+                <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
+                <div className="meta">{fmt(ev.event_date)}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Live readiness — paper only</h2>
+        <p className="section-note">
+          Alpaca mode is paper only — the code refuses a non-paper URL, and live trading needs a separate explicit approval. Do not go live until: backtest hit rate is known (first outcomes Nov 2), paper trades have been validated end-to-end, and the take-profit/stop-loss job is re-enabled in cron-job.org (its status cannot be read from here — check it there).
+        </p>
+        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +5% / −3%.</div>
       </section>
 
       <section className="section">

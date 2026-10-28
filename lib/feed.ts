@@ -89,7 +89,7 @@ function recordDiag(label: string, status: string) {
   feedDiagnostics[label] = status;
 }
 
-async function fetchJson(
+export async function fetchJson(
   url: string,
   timeoutMs = 8000,
   label?: string,
@@ -112,13 +112,13 @@ async function fetchJson(
   }
 }
 
-function asRecord(v: unknown): Record<string, unknown> | null {
+export function asRecord(v: unknown): Record<string, unknown> | null {
   return v !== null && typeof v === "object" && !Array.isArray(v)
     ? (v as Record<string, unknown>)
     : null;
 }
 
-function num(v: unknown): number | undefined {
+export function num(v: unknown): number | undefined {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) {
     return Number(v);
@@ -488,6 +488,7 @@ export interface MonthlyCandleData {
   summary: string;
   sessions: number;
   monthPct: number;
+  change5dPct: number | null;
   // Simple 14-day RSI (average gain / average loss over the last 14
   // daily changes, not Wilder-smoothed). 0-100, null if too few data.
   rsi14: number | null;
@@ -574,10 +575,15 @@ export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandl
     belowHighPct !== null ? `${belowHighPct.toFixed(1)}% below month high` : null,
     rsi14 !== null ? `RSI(14) ${rsi14.toFixed(0)}` : null,
   ].filter((p): p is string => p !== null);
+  const change5dPct =
+    closes.length >= 6
+      ? ((last - closes[closes.length - 6]) / closes[closes.length - 6]) * 100
+      : null;
   return {
     summary: `${parts.join(", ")}${volumePart}.`,
     sessions: closes.length,
     monthPct,
+    change5dPct,
     rsi14,
     avgAbsDailyPct,
     maxAbsDailyPct,
@@ -591,6 +597,83 @@ export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandl
 export async function getMonthlyCandleSummary(symbol: string): Promise<string | null> {
   const data = await getMonthlyCandleData(symbol);
   return data?.summary ?? null;
+}
+
+export interface EarningsHistory {
+  beats: number;
+  total: number;
+  avgSurprisePct: number | null;
+  latestSurprisePct: number | null;
+  summary: string;
+}
+
+/**
+ * Earnings surprise history from Finnhub /stock/earnings (last 4
+ * reported quarters, fail-soft). A repeat beater is a different setup
+ * from a first-time earnings bet, so this is stored in reasoning and
+ * used as a small shortlist-score modifier in /api/weekly — never as
+ * a standalone pick. Returns null on any provider failure.
+ */
+export async function getEarningsHistory(symbol: string): Promise<EarningsHistory | null> {
+  const key = process.env.FINNHUB_KEY;
+  if (!key) return null;
+  const data = await fetchJson(
+    `https://finnhub.io/api/v1/stock/earnings?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(key)}`,
+    6000,
+  );
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const rows = data
+    .filter((r) => typeof r === "object" && r !== null && typeof (r as any).actual === "number" && typeof (r as any).estimate === "number")
+    .slice(0, 4) as Array<{ actual: number; estimate: number; surprisePercent?: number }>;
+  if (rows.length === 0) return null;
+  const surprises = rows
+    .map((r) => (typeof r.surprisePercent === "number" ? r.surprisePercent : r.estimate !== 0 ? ((r.actual - r.estimate) / Math.abs(r.estimate)) * 100 : null))
+    .filter((v): v is number => v !== null);
+  if (surprises.length === 0) return null;
+  const beats = surprises.filter((s) => s > 0).length;
+  const avg = surprises.reduce((a, b) => a + b, 0) / surprises.length;
+  const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  return {
+    beats,
+    total: surprises.length,
+    avgSurprisePct: avg,
+    latestSurprisePct: surprises[0],
+    summary: `Earnings history: beat ${beats}/${surprises.length} quarters, avg surprise ${fmt(avg)}.`,
+  };
+}
+
+export interface MacroEvent {
+  date: string;
+  event: string;
+}
+
+/**
+ * Major US macro events in the coming 7 days, from Finnhub's economic
+ * calendar, filtered by keyword (CPI, FOMC/Fed, jobs, GDP, retail).
+ * Shown as a dashboard note only — macro moves whole sectors, it is
+ * not mapped to a single ticker as a catalyst. Fail-soft: [] on error.
+ */
+export async function getMacroEvents(from: string, to: string): Promise<MacroEvent[]> {
+  const key = process.env.FINNHUB_KEY;
+  if (!key) return [];
+  const data = await fetchJson(
+    `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
+    8000,
+  );
+  const r = asRecord(data);
+  const list = r && Array.isArray(r.economicCalendar) ? r.economicCalendar : [];
+  const keywords = ["cpi", "consumer price", "fomc", "federal reserve", "fed", "nonfarm", "non-farm", "employment", "jobless", "gdp", "retail sales", "pce"];
+  const out: MacroEvent[] = [];
+  for (const item of list as Array<Record<string, unknown>>) {
+    const country = String(item.country ?? "").toUpperCase();
+    const event = String(item.event ?? "");
+    if (country && country !== "US") continue;
+    const low = event.toLowerCase();
+    if (!keywords.some((k) => low.includes(k))) continue;
+    const date = String(item.time ?? "").slice(0, 10) || from;
+    if (!out.some((o) => o.date === date && o.event === event)) out.push({ date, event });
+  }
+  return out.slice(0, 20);
 }
 
 // -------------------------------------------------------------- sentiment
