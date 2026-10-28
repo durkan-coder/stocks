@@ -469,6 +469,75 @@ export async function getCandleStats(symbol: string): Promise<CandleStats | null
   return { change5dPct, volumeRatio };
 }
 
+/**
+ * Monthly candlestick summary for ONE ticker, from daily candles over
+ * the past ~35 calendar days. Reasoning-only, by design: it is stored
+ * in weekly_shortlist.reasoning by /api/weekly and shown on the
+ * leaderboard, but it does NOT change any score (technical, volume,
+ * catalyst, sentiment all stay exactly as before).
+ *
+ * Factual summary only — no candlestick pattern names ("hammer",
+ * "engulfing", …): those labels add false precision on noisy daily
+ * data. What is reported: month return, up/down session count,
+ * last-3-session move, price vs 20-day average, distance from the
+ * month high, and volume vs its 20-day average. Returns null on any
+ * provider failure or too few sessions — the caller then writes no
+ * monthly line, never a fabricated one.
+ */
+export async function getMonthlyCandleSummary(symbol: string): Promise<string | null> {
+  const key = process.env.FINNHUB_KEY;
+  if (!key) return null;
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - 35 * 24 * 3600;
+  const data = await fetchJson(
+    `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
+    6000,
+  );
+  const r = asRecord(data);
+  if (!r || r.s !== "ok" || !Array.isArray(r.c) || r.c.length < 10) return null;
+  const closes = (r.c as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+  if (closes.length < 10) return null;
+  const first = closes[0];
+  const last = closes[closes.length - 1];
+  if (first <= 0 || last <= 0) return null;
+  const monthPct = ((last - first) / first) * 100;
+  let up = 0;
+  let down = 0;
+  for (let i = 1; i < closes.length; i++) {
+    if (closes[i] > closes[i - 1]) up++;
+    else if (closes[i] < closes[i - 1]) down++;
+  }
+  const last3Pct =
+    closes.length >= 4
+      ? ((last - closes[closes.length - 4]) / closes[closes.length - 4]) * 100
+      : null;
+  const window = closes.slice(-20);
+  const avg20 = window.reduce((a, b) => a + b, 0) / window.length;
+  const vsAvg20Pct = avg20 > 0 ? ((last - avg20) / avg20) * 100 : null;
+  const highs = Array.isArray(r.h)
+    ? (r.h as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined)
+    : [];
+  const monthHigh = highs.length === closes.length && highs.length > 0 ? Math.max(...highs) : Math.max(...closes);
+  const belowHighPct = monthHigh > 0 ? ((last - monthHigh) / monthHigh) * 100 : null;
+  let volumePart = "";
+  if (Array.isArray(r.v) && r.v.length === closes.length) {
+    const vols = (r.v as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+    if (vols.length >= 11) {
+      const prior = vols.slice(-21, -1);
+      const avgVol = prior.reduce((a, b) => a + b, 0) / prior.length;
+      if (avgVol > 0) volumePart = `, volume ${(vols[vols.length - 1] / avgVol).toFixed(1)}x 20-day average`;
+    }
+  }
+  const fmt = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  const parts = [
+    `Month (candles): ${fmt(monthPct)} over ${closes.length} sessions (${up} up / ${down} down)`,
+    last3Pct !== null ? `last 3 sessions ${fmt(last3Pct)}` : null,
+    vsAvg20Pct !== null ? `price ${fmt(vsAvg20Pct)} vs 20-day average` : null,
+    belowHighPct !== null ? `${belowHighPct.toFixed(1)}% below month high` : null,
+  ].filter((p): p is string => p !== null);
+  return `${parts.join(", ")}${volumePart}.`;
+}
+
 // -------------------------------------------------------------- sentiment
 
 const POSITIVE_WORDS = [

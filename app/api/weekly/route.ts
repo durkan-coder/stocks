@@ -7,6 +7,7 @@ import {
   feedDiagnostics,
   getCompanyNews,
   getEarningsCalendar,
+  getMonthlyCandleSummary,
   getSp500Constituents,
   isoDate,
   mapLimit,
@@ -28,6 +29,8 @@ import { analyzeSentimentBatch, sentimentToScore100 } from "@/lib/openrouter";
 // LLM sentiment (lib/openrouter.ts) is called HERE, once a day, in
 // batches of <=10 tickers — never in the 15-minute scan. Its result is
 // stored in weekly_shortlist.reasoning so /api/scan can reuse it.
+// Monthly candlestick summaries (lib/feed.ts getMonthlyCandleSummary)
+// are also computed HERE, once a day, reasoning-only — no score change.
 // If every feed call fails, this route writes nothing rather than a
 // fake 50: an empty shortlist is correct, and /api/scan will then
 // record an empty scan.
@@ -126,13 +129,38 @@ export async function POST(req: NextRequest) {
   }
   const newTickers = top50.filter((e) => !previous.has(e.ticker)).map((e) => e.ticker);
 
+  // Monthly candlestick summary, once a day, reasoning-only.
+  // Daily candles for the shortlist tickers only (never per 15-min
+  // scan tick), concurrency 8, fail-soft per ticker: a ticker with
+  // no candle data simply gets no monthly line. This does NOT
+  // change any score — technical/volume/catalyst/sentiment are
+  // computed exactly as before in /api/scan.
+  const monthlyByTicker = new Map<string, string>();
+  if (top50.length > 0) {
+    const monthlyPairs = await mapLimit(top50, 8, async (e) => ({
+      ticker: e.ticker,
+      summary: await getMonthlyCandleSummary(e.ticker),
+    }));
+    for (const pair of monthlyPairs) {
+      if (pair.summary) monthlyByTicker.set(pair.ticker, pair.summary);
+    }
+  }
+
   for (const e of top50) {
     const llm = sentimentByTicker.get(e.ticker);
+    const monthly = monthlyByTicker.get(e.ticker);
     // event_detail stays the raw catalyst; reasoning carries it plus
-    // the stored LLM sentiment, which /api/scan parses back out.
-    const reasoning = llm
-      ? `${e.detail} Sentiment (LLM): ${llm.label}, ${((llm.score100 - 50) / 50).toFixed(2)} — ${llm.reason}`
-      : e.detail;
+    // the monthly candle summary and the stored LLM sentiment, which
+    // /api/scan parses back out (LLM regex) and displays as-is.
+    const reasoning = [
+      e.detail,
+      monthly ?? null,
+      llm
+        ? `Sentiment (LLM): ${llm.label}, ${((llm.score100 - 50) / 50).toFixed(2)} — ${llm.reason}`
+        : null,
+    ]
+      .filter((p): p is string => p !== null)
+      .join(" ");
     await sql`
       INSERT INTO weekly_shortlist
         (week_start, ticker, company, catalyst_type, event_date,
@@ -156,6 +184,7 @@ export async function POST(req: NextRequest) {
     earningsInWindow: earnings.length,
     companyNewsTickers: companyNewsByTicker.size,
     sentimentTickers: sentimentByTicker.size,
+    monthlyCandleTickers: monthlyByTicker.size,
     // Diagnostics only: HTTP status per provider (no keys, no bodies).
     // 401 = bad key, 402 = paid endpoint, 403 = plan blocked,
     // 429 = rate limit, timeout-or-network-error = fetch failed.
