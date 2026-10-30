@@ -22,21 +22,52 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
+  const sql = neon(process.env.DATABASE_URL!);
+  // Recorded run (see externally_scheduled_job_diagnostics): cron-job.org
+  // cannot be read by Muse, so every daily run writes its own record
+  // to Neon — including runs that produce no trade — and the dashboard
+  // shows the latest attempts. That distinguishes, from public data
+  // alone, a run that never started (no attempt row) from a run that
+  // started and failed (alpaca_buy_failed + detail) and from a run
+  // that succeeded without a buy (skipped_all_bought). No secrets are
+  // ever written to the detail field: only outcome, ticker, rank,
+  // scan id and the Alpaca error status/message.
+  const logAttempt = async (outcome: string, scanId: number | null, ticker: string | null, rank: number | null, detail: string | null) => {
+    try {
+      await sql`CREATE TABLE IF NOT EXISTS trade_attempts (
+        id SERIAL PRIMARY KEY,
+        job TEXT NOT NULL DEFAULT 'trade_daily',
+        scan_id INTEGER,
+        ticker TEXT,
+        leaderboard_rank INTEGER,
+        outcome TEXT NOT NULL,
+        detail TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`;
+      await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
+        VALUES ('trade_daily', ${scanId}, ${ticker}, ${rank}, ${outcome}, ${detail})`;
+    } catch {
+      // Logging must never break the trade itself.
+    }
+  };
+
   const secret = process.env.CRON_SECRET;
   if (secret) {
     const auth = req.headers.get("authorization") ?? "";
     if (auth !== `Bearer ${secret}`) {
+      await logAttempt("unauthorized", null, null, null, null);
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });
     }
   }
 
-  const sql = neon(process.env.DATABASE_URL!);
   const latest = await sql`
     SELECT id FROM scans ORDER BY id DESC LIMIT 1
   `;
   if (latest.length === 0) {
+    await logAttempt("no_scan", null, null, null, null);
     return NextResponse.json({ ok: false, error: "no leaderboard scan yet" }, { status: 400 });
   }
+  await logAttempt("started", latest[0].id, null, null, null);
   const rows = await sql`
     SELECT rank, ticker, price FROM leaderboard
     WHERE scan_id = ${latest[0].id} ORDER BY rank ASC
@@ -58,11 +89,14 @@ export async function POST(req: NextRequest) {
     try {
       order = await placeNotionalBuy(ticker, TRADE_NOTIONAL_USD);
     } catch (e: any) {
+      const detail = String(e?.message ?? e).slice(0, 300);
+      await logAttempt("alpaca_buy_failed", latest[0].id, ticker, row.rank, detail);
       return NextResponse.json(
-        { ok: false, error: "alpaca_buy_failed", ticker, detail: String(e?.message ?? e).slice(0, 300) },
+        { ok: false, error: "alpaca_buy_failed", ticker, detail },
         { status: 502 },
       );
     }
+    await logAttempt("bought", latest[0].id, ticker, row.rank, order?.id ? `order ${order.id}` : null);
     await sql`
       INSERT INTO paper_trades
         (week_start, ticker, leaderboard_rank, entry_price, notional_usd, alpaca_order_id, status)
@@ -75,6 +109,7 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  await logAttempt("skipped_all_bought", latest[0].id, null, null, null);
   return NextResponse.json({
     ok: true,
     weekStart,
