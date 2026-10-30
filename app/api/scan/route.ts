@@ -59,6 +59,8 @@ interface ShortlistRow {
   volume_ratio?: number | null;
   change_5d_pct?: number | null;
   sector_rel_pct?: number | null;
+  avg_abs_daily_pct?: number | null;
+  event_date?: string | null;
 }
 
 export async function POST(req: NextRequest) {
@@ -94,7 +96,8 @@ export async function POST(req: NextRequest) {
       try {
         shortlist = await sql`
           SELECT ticker, company, catalyst_type, event_detail, reasoning, score,
-                 rsi14, month_pct, volume_ratio, change_5d_pct, sector_rel_pct
+                 rsi14, month_pct, volume_ratio, change_5d_pct, sector_rel_pct,
+                 avg_abs_daily_pct, event_date
           FROM weekly_shortlist
           WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM weekly_shortlist)
           ORDER BY score DESC LIMIT 50
@@ -229,20 +232,48 @@ export async function POST(req: NextRequest) {
 
     // Technical, now real multi-day data when the latest shortlist
     // carries it (from tomorrow's weekly rebuild onward):
-    // 50% 1-day move + 30% month move + 20% RSI score (RSI near 60 is
-    // strongest; very overbought/oversold are penalised). Without
-    // monthly data, falls back to the old 1-day-only formula.
+    // 40% 1-day move + 25% month move + 15% RSI score (RSI near 60 is
+    // strongest; very overbought/oversold are penalised) + 20%
+    // volatility score. Volatility matters for a 5% target: a stock
+    // that normally moves 3% a day is far more likely to reach +5%
+    // in a week than one that moves 0.8%. volScore maps average
+    // absolute daily move (avg_abs_daily_pct, already stored by
+    // weekly) 1% -> 40, 2% -> 50, 3% -> 60, 4% -> 70, 5%+ -> 80.
+    // Without monthly data, falls back to the old 1-day-only formula.
     const change1dPct = quote.changePct;
     const clamp = (v: number) => Math.max(0, Math.min(100, v));
     const technical1d =
       change1dPct === undefined ? 50 : clamp(50 + change1dPct * 10);
     let technical = technical1d;
     const m = mode === "on_demand" ? null : shortlist;
+    let volScore: number | null = null;
     if (m && m.month_pct !== null && m.month_pct !== undefined) {
       const technicalMonth = clamp(50 + Number(m.month_pct) * 3);
       const rsi = m.rsi14 !== null && m.rsi14 !== undefined ? Number(m.rsi14) : null;
       const rsiScore = rsi === null ? 50 : clamp(100 - Math.abs(rsi - 60) * 1.5);
-      technical = 0.5 * technical1d + 0.3 * technicalMonth + 0.2 * rsiScore;
+      const avgAbs = m.avg_abs_daily_pct !== null && m.avg_abs_daily_pct !== undefined ? Number(m.avg_abs_daily_pct) : null;
+      volScore = avgAbs === null ? 50 : Math.max(20, Math.min(85, 30 + avgAbs * 10));
+      technical = 0.4 * technical1d + 0.25 * technicalMonth + 0.15 * rsiScore + 0.2 * volScore;
+    }
+
+    // Earnings proximity: a catalyst that fires sooner is more
+    // likely to move the price inside the 1-week horizon, so an
+    // earnings catalyst within 7 days gets a small bonus (<=2 days
+    // +10, <=4 days +7, <=7 days +4), capped at 100. This does not
+    // create a catalyst — only earnings rows already on the board
+    // get it, and non-earnings catalysts get nothing.
+    let catalystScore = catalystRow.score;
+    let daysToEvent: number | null = null;
+    if (m && catalystRow.catalyst_type === "earnings" && m.event_date) {
+      const ev = Date.parse(`${String(m.event_date).slice(0, 10)}T00:00:00Z`);
+      if (Number.isFinite(ev)) {
+        const today = new Date();
+        today.setUTCHours(0, 0, 0, 0);
+        daysToEvent = Math.round((ev - today.getTime()) / (24 * 3600 * 1000));
+        if (daysToEvent >= 0 && daysToEvent <= 2) catalystScore = Math.min(100, catalystScore + 10);
+        else if (daysToEvent <= 4) catalystScore = Math.min(100, catalystScore + 7);
+        else if (daysToEvent <= 7) catalystScore = Math.min(100, catalystScore + 4);
+      }
     }
 
     // Sentiment: stored LLM sentiment first, else rule-based headlines.
@@ -307,14 +338,20 @@ export async function POST(req: NextRequest) {
                   ? 35
                   : 20;
 
+    const volNote = volScore !== null && m?.avg_abs_daily_pct !== null && m?.avg_abs_daily_pct !== undefined
+      ? ` Volatility: avg daily move ${Number(m.avg_abs_daily_pct).toFixed(1)}%.`
+      : "";
+    const proxNote = daysToEvent !== null && daysToEvent >= 0 && daysToEvent <= 7
+      ? ` Earnings in ${daysToEvent} day${daysToEvent === 1 ? "" : "s"}.`
+      : "";
     candidates.push({
       ticker,
       technical,
-      catalyst: catalystRow.score,
+      catalyst: catalystScore,
       sentiment,
       volume,
       sector,
-      reasoning: catalystRow.reasoning,
+      reasoning: `${catalystRow.reasoning}${volNote}${proxNote}`,
       catalystLabel: `${catalystRow.catalyst_type}: ${catalystRow.event_detail}`,
       sentimentLabel,
       price: quote.price,

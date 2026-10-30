@@ -506,18 +506,7 @@ export interface MonthlyCandleData {
   breakout: boolean;
 }
 
-export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandleData | null> {
-  const key = process.env.FINNHUB_KEY;
-  if (!key) return null;
-  const to = Math.floor(Date.now() / 1000);
-  const from = to - 35 * 24 * 3600;
-  const data = await fetchJson(
-    `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
-    6000,
-  );
-  const r = asRecord(data);
-  if (!r || r.s !== "ok" || !Array.isArray(r.c) || r.c.length < 10) return null;
-  const closes = (r.c as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+function computeMonthlyCandleData(closes: number[], highs: number[], vols: number[]): MonthlyCandleData | null {
   if (closes.length < 10) return null;
   const first = closes[0];
   const last = closes[closes.length - 1];
@@ -550,15 +539,11 @@ export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandl
   const window = closes.slice(-20);
   const avg20 = window.reduce((a, b) => a + b, 0) / window.length;
   const vsAvg20Pct = avg20 > 0 ? ((last - avg20) / avg20) * 100 : null;
-  const highs = Array.isArray(r.h)
-    ? (r.h as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined)
-    : [];
   const monthHigh = highs.length === closes.length && highs.length > 0 ? Math.max(...highs) : Math.max(...closes);
   const belowHighPct = monthHigh > 0 ? ((last - monthHigh) / monthHigh) * 100 : null;
   let volumeRatio: number | null = null;
   let volumePart = "";
-  if (Array.isArray(r.v) && r.v.length === closes.length) {
-    const vols = (r.v as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+  if (vols.length === closes.length) {
     if (vols.length >= 11) {
       const prior = vols.slice(-21, -1);
       const avgVol = prior.reduce((a, b) => a + b, 0) / prior.length;
@@ -594,6 +579,55 @@ export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandl
     belowHighPct,
     breakout: (vsAvg20Pct ?? -999) > 0 && (belowHighPct ?? -999) >= -3,
   };
+}
+
+export async function getMonthlyCandleData(symbol: string): Promise<MonthlyCandleData | null> {
+  // Finnhub first; on any failure (including a 429, which the weekly
+  // run hits when it makes ~100+ Finnhub calls in one run against the
+  // 60/min free limit) fall back to TwelveData time_series, a
+  // different provider with a different quota. A ticker with no data
+  // from either still returns null — never fabricated.
+  const finnhubKey = process.env.FINNHUB_KEY;
+  if (finnhubKey) {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - 35 * 24 * 3600;
+    const data = await fetchJson(
+      `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(finnhubKey)}`,
+      6000,
+    );
+    const r = asRecord(data);
+    if (r && r.s === "ok" && Array.isArray(r.c)) {
+      const closes = (r.c as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+      const highs = Array.isArray(r.h)
+        ? (r.h as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined)
+        : [];
+      const vols = Array.isArray(r.v)
+        ? (r.v as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined)
+        : [];
+      const out = computeMonthlyCandleData(closes, highs, vols);
+      if (out) return out;
+    }
+  }
+  const tdKey = process.env.TWELVE_DATA_KEY;
+  if (tdKey) {
+    const data = await fetchJson(
+      `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=35&apikey=${encodeURIComponent(tdKey)}`,
+      8000,
+    );
+    const r = asRecord(data);
+    if (r && Array.isArray(r.values)) {
+      const rows = (r.values as unknown[])
+        .map((v) => asRecord(v))
+        .filter((v): v is Record<string, unknown> => v !== null)
+        .sort((a, b) => String(a.datetime).localeCompare(String(b.datetime)));
+      const closes = rows.map((v) => num(v.close)).filter((v): v is number => v !== undefined);
+      const highs = rows.map((v) => num(v.high)).filter((v): v is number => v !== undefined);
+      const vols = rows.map((v) => num(v.volume)).filter((v): v is number => v !== undefined);
+      const out = computeMonthlyCandleData(closes, highs, vols);
+      if (out) return out;
+    }
+  }
+  return null;
 }
 
 export async function getMonthlyCandleSummary(symbol: string): Promise<string | null> {

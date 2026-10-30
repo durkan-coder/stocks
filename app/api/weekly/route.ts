@@ -134,13 +134,17 @@ export async function POST(req: NextRequest) {
 
   // Monthly candlestick summary, once a day, reasoning-only.
   // Daily candles for the shortlist tickers only (never per 15-min
-  // scan tick), concurrency 8, fail-soft per ticker: a ticker with
-  // no candle data simply gets no monthly line. This does NOT
-  // change any score — technical/volume/catalyst/sentiment are
-  // computed exactly as before in /api/scan.
+  // scan tick), concurrency 4 (lowered from 8: the weekly run makes
+  // ~100+ Finnhub calls against a 60/min free limit, and the
+  // monthly batch was the one returning empty on Oct 28), fail-soft
+  // per ticker, with a TwelveData fallback inside
+  // getMonthlyCandleData. A ticker with no data from either provider
+  // simply gets no monthly line. This does NOT change any score —
+  // technical/volume/catalyst/sentiment are computed exactly as
+  // before in /api/scan.
   const monthlyByTicker = new Map<string, MonthlyCandleData>();
   if (top50.length > 0) {
-    const monthlyPairs = await mapLimit(top50, 8, async (e) => ({
+    const monthlyPairs = await mapLimit(top50, 4, async (e) => ({
       ticker: e.ticker,
       data: await getMonthlyCandleData(e.ticker),
     }));
@@ -168,7 +172,9 @@ export async function POST(req: NextRequest) {
   };
   const sectorMonthByEtf = new Map<string, number>();
   try {
-    const etfPairs = await mapLimit(Object.values(sectorEtfBySector), 5, async (etf) => ({
+    // Dedupe: XLK/XLF/XLV each appear twice in the sector map, so
+    // the old Object.values list made 14 ETF calls for 11 ETFs.
+    const etfPairs = await mapLimit([...new Set(Object.values(sectorEtfBySector))], 4, async (etf) => ({
       etf,
       data: await getMonthlyCandleData(etf),
     }));

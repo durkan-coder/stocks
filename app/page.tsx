@@ -88,8 +88,8 @@ async function getData() {
   const backtestRecent = await safe(
     () =>
       sql`
-        SELECT scan_date, ticker, rank, score, entry_price, outcome_pct, max_pct, hit_5
-        FROM pick_outcomes ORDER BY scan_date DESC, rank ASC LIMIT 20
+        SELECT scan_date, ticker, rank, score, entry_price, outcome_pct, max_pct, hit_5, catalyst_type
+        FROM pick_outcomes ORDER BY scan_date DESC, rank ASC LIMIT 500
       `,
     [] as AnyRow[],
   );
@@ -189,6 +189,24 @@ export default async function Page() {
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
   const openTrades = trades.filter((t) => t.status === "open");
+  // Backtest calibration (ready for Nov 2 outcomes, honestly empty
+  // until then): hit rate by score bucket and by catalyst type, so
+  // score weights can be reweighted to what actually predicted a
+  // +5% hit instead of to what sounded plausible. Computed from
+  // pick_outcomes rows only — never from leaderboard scores alone.
+  const calibBucket = (label: string, rows: AnyRow[]) => ({
+    label,
+    total: rows.length,
+    hits: rows.filter((r) => r.hit_5).length,
+  });
+  const calibBuckets = [
+    calibBucket("Score ≥ 75 (strong)", backtestRecent.filter((r) => Number(r.score) >= 75)),
+    calibBucket("Score 60–74 (notable)", backtestRecent.filter((r) => Number(r.score) >= 60 && Number(r.score) < 75)),
+    calibBucket("Score < 60 (watch)", backtestRecent.filter((r) => Number(r.score) < 60)),
+  ];
+  const calibByCatalyst = [...new Map(backtestRecent.map((r) => [r.catalyst_type ?? "unknown", true])).keys()].map((cat) =>
+    calibBucket(String(cat), backtestRecent.filter((r) => (r.catalyst_type ?? "unknown") === cat)),
+  );
   const newToday = shortlist.filter((s) => s.is_new).length;
   const leaders = sectorLeaders(board);
   const emptySectors = GICS_SECTORS.filter((s) => !leaders.has(s));
@@ -438,6 +456,32 @@ export default async function Page() {
                 </div>
               ))}
             </div>
+          </>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Backtest calibration — what actually predicted +5%</h2>
+        <p className="section-note">Hit rate by score bucket and by catalyst type, from recorded 7-day outcomes only. Use this, not intuition, to reweight the score: a bucket that hits rarely should not outrank one that hits often. Empty until the first outcomes land Nov 2.</p>
+        {backtestTotal === 0 ? (
+          <p>No 7-day outcomes yet — calibration appears with the first outcomes.</p>
+        ) : (
+          <>
+            <div className="cards">
+              {calibBuckets.map((b) => (
+                <div key={b.label} className="row-card">
+                  <div className="ticker" style={{ fontSize: 15 }}>{b.label}</div>
+                  <div className="meta">{b.total ? `${((b.hits / b.total) * 100).toFixed(1)}% hit rate · ${b.hits}/${b.total} picks` : "no picks"}</div>
+                </div>
+              ))}
+              {calibByCatalyst.map((b) => (
+                <div key={`cat-${b.label}`} className="row-card">
+                  <div className="ticker" style={{ fontSize: 15 }}>Catalyst: {b.label}</div>
+                  <div className="meta">{b.total ? `${((b.hits / b.total) * 100).toFixed(1)}% hit rate · ${b.hits}/${b.total} picks` : "no picks"}</div>
+                </div>
+              ))}
+            </div>
+            <p className="meta">Recent outcomes shown: {backtestRecent.slice(0, 20).length} of {backtestTotal} total (calibration uses up to 500 recent rows).</p>
           </>
         )}
       </section>
