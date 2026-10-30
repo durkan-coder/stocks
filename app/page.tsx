@@ -103,7 +103,15 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro };
+  const attempts = await safe(
+    () =>
+      sql`
+        SELECT job, scan_id, ticker, leaderboard_rank, outcome, detail, created_at
+        FROM trade_attempts ORDER BY created_at DESC LIMIT 10
+      `,
+    [] as AnyRow[],
+  );
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro, attempts };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -176,7 +184,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro, attempts } = await getData();
   const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
@@ -375,6 +383,28 @@ export default async function Page() {
                 </div>
                 <div className="meta">Entry {t.entry_price ?? "—"} (${t.notional_usd}) · Exit {t.exit_price ?? "—"} · P&amp;L {t.pnl_pct ?? "—"}</div>
                 <div className="meta">Opened {fmt(t.opened_at)}{t.closed_at ? ` · Closed ${fmt(t.closed_at)}` : ""}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Daily buy attempts — recorded runs</h2>
+        <p className="section-note">Every /api/trade/daily run writes a row here, even when it buys nothing — so a missing row means the cron job never reached the app, while a row with an outcome shows exactly where it stopped. No secrets are stored in these rows.</p>
+        {attempts.length === 0 ? (
+          <p>No daily buy attempts recorded yet. Attempts are only written by runs on the deployed code from Oct 30 onward — earlier runs left no row, which is why their cause is still unproven.</p>
+        ) : (
+          <div className="cards">
+            {attempts.map((a: any, i: number) => (
+              <div key={`${a.created_at}-${i}`} className="row-card">
+                <div className="row-top">
+                  <div>
+                    <div className="ticker">{a.outcome}</div>
+                    <div className="company">{a.ticker ? `${a.ticker} · Rank ${a.leaderboard_rank ?? "—"}` : "no ticker"} · Scan {a.scan_id ?? "—"}</div>
+                  </div>
+                </div>
+                <div className="meta">{fmt(a.created_at)}{a.detail ? ` · ${a.detail}` : ""}</div>
               </div>
             ))}
           </div>
