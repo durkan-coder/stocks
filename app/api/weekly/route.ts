@@ -10,12 +10,12 @@ import {
   getEarningsHistory,
   getMacroEvents,
   getMonthlyCandleData,
-  getSp500Constituents,
   type MonthlyCandleData,
   isoDate,
   mapLimit,
   type NewsItem,
 } from "@/lib/feed";
+import { getUniverse } from "@/lib/universe";
 import { analyzeSentimentBatch, screenSetups, sentimentToScore100 } from "@/lib/openrouter";
 
 // Stage 1, run EVERY DAY via cron-job.org (e.g. pre-market ET).
@@ -24,7 +24,8 @@ import { analyzeSentimentBatch, screenSetups, sentimentToScore100 } from "@/lib/
 // a new catalyst is added the same day, not next week, and flagged is_new.
 // Same CRON_SECRET protection as /api/scan.
 //
-// Real feed (see lib/feed.ts): FMP S&P 500 constituents, Finnhub
+// Real feed (see lib/feed.ts, lib/universe.ts): universe via
+// getUniverse() (live FMP, else static 503), Finnhub
 // earnings calendar for the coming 7 days, and Finnhub company news
 // for earnings tickers only (rate-limit guard). General market news
 // is NOT used as a per-ticker catalyst — a broad headline mapped to
@@ -60,7 +61,17 @@ export async function POST(req: NextRequest) {
   const to = isoDate(addDays(now, 7));
   const newsFrom = isoDate(addDays(now, -3));
 
-  const constituentsResult = await getSp500Constituents();
+  // Universe fix (2026-10-30, shortlist stuck at 2): weekly used
+  // getSp500Constituents() directly, which falls back to a ~30-name
+  // list when FMP is 401 — so only earnings among those 30 names
+  // could ever make the shortlist, no matter the top-50 cap. Use
+  // getUniverse() instead: live FMP when it works, else the static
+  // 503-name S&P 500 list (public tickers with sectors), so a
+  // 7-day earnings window across the full index naturally yields
+  // well over 10 candidates in earnings season. Catalyst rules are
+  // unchanged: earnings + the company's own news only, no invented
+  // rows, and the top-50 cap still applies.
+  const constituentsResult = await getUniverse();
   const constituents = constituentsResult.list;
   const earnings = await getEarningsCalendar(from, to);
 
@@ -85,7 +96,37 @@ export async function POST(req: NextRequest) {
     earnings,
     companyNewsByTicker,
   });
-  const top50 = selectTop50(events);
+  let top50 = selectTop50(events);
+
+  // Minimum-fill (2026-10-30, Durkan: shortlist AND leaderboard must
+  // have at least 10): the 7-day window across the full index is
+  // usually plenty in earnings season, but in a quiet week it can
+  // still land below 10 — and the leaderboard can never exceed the
+  // shortlist, since the 15-minute scan only covers shortlist
+  // tickers. So if top50 < 10, extend the earnings window in 7-day
+  // steps (up to 28 days total) and add those verified earnings
+  // events until 10 is reached. Every added ticker still has a
+  // real, dated earnings catalyst — its event date is stored and
+  // shown, so a 14/21/28-day earnings ticker is visibly further
+  // out than a 7-day one. No ticker is ever invented to fill a
+  // slot, and the top-50 cap still applies. One Finnhub calendar
+  // call per extra window; no extra news/monthly calls.
+  let fillWindowStart = to;
+  let fillWindowEnd = to;
+  while (top50.length < 10 && fillWindowEnd < isoDate(addDays(now, 28))) {
+    fillWindowStart = isoDate(addDays(new Date(fillWindowEnd + "T00:00:00Z"), 1));
+    fillWindowEnd = isoDate(addDays(new Date(fillWindowStart + "T00:00:00Z"), 6));
+    const extraEarnings = await getEarningsCalendar(fillWindowStart, fillWindowEnd);
+    if (extraEarnings.length === 0) continue;
+    const extraEvents = buildCatalystEvents({
+      constituents,
+      earnings: extraEarnings,
+      companyNewsByTicker: new Map(),
+    });
+    if (extraEvents.length === 0) continue;
+    events.push(...extraEvents);
+    top50 = selectTop50(events);
+  }
 
   // LLM sentiment, once a day, batched (<=10 per call). Headlines are
   // the company's own news where available, else the event detail.
