@@ -409,7 +409,7 @@ export default async function Page() {
 
       <section className="section">
         <h2>Paper trades — Alpaca paper only</h2>
-        <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +5% or −3%.</p>
+        <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +5% or −3%. <a href="/positions">View positions →</a></p>
         {trades.length === 0 ? (
           <p>No paper trades yet.</p>
         ) : (
