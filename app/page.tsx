@@ -111,16 +111,26 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  const stagger = await safe(
-    () =>
-      sql`
-        SELECT (SELECT COUNT(*) FROM price_cache WHERE updated_at > NOW() - INTERVAL '65 minutes') AS quotes_covered,
-               (SELECT COUNT(*) FROM ticker_technicals WHERE updated_at > NOW() - INTERVAL '26 hours') AS tech_covered,
-               (SELECT MAX(updated_at) FROM price_cache) AS quotes_at,
-               (SELECT MAX(updated_at) FROM ticker_technicals) AS tech_at
-      `,
+  // Separate safe queries: a single combined query fails entirely
+  // when either stagger table does not exist yet (e.g. quotes have
+  // run but daily has only ever 401'd, so ticker_technicals was
+  // never created), which would hide the quotes coverage too.
+  const staggerQuotes = await safe(
+    () => sql`SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM price_cache WHERE updated_at > NOW() - INTERVAL '65 minutes'`,
     [] as AnyRow[],
   );
+  const staggerTech = await safe(
+    () => sql`SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM ticker_technicals WHERE updated_at > NOW() - INTERVAL '26 hours'`,
+    [] as AnyRow[],
+  );
+  const stagger = [
+    {
+      quotes_covered: staggerQuotes[0]?.n ?? 0,
+      tech_covered: staggerTech[0]?.n ?? 0,
+      quotes_at: staggerQuotes[0]?.at ?? null,
+      tech_at: staggerTech[0]?.at ?? null,
+    },
+  ];
   const staggerState = await safe(
     () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
     [] as AnyRow[],
