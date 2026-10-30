@@ -111,7 +111,21 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro, attempts };
+  const stagger = await safe(
+    () =>
+      sql`
+        SELECT (SELECT COUNT(*) FROM price_cache WHERE updated_at > NOW() - INTERVAL '65 minutes') AS quotes_covered,
+               (SELECT COUNT(*) FROM ticker_technicals WHERE updated_at > NOW() - INTERVAL '26 hours') AS tech_covered,
+               (SELECT MAX(updated_at) FROM price_cache) AS quotes_at,
+               (SELECT MAX(updated_at) FROM ticker_technicals) AS tech_at
+      `,
+    [] as AnyRow[],
+  );
+  const staggerState = await safe(
+    () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
+    [] as AnyRow[],
+  );
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro, attempts, stagger: stagger[0] ?? null, staggerState };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -184,7 +198,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro, attempts } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro, attempts, stagger, staggerState } = await getData();
   const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
@@ -483,6 +497,22 @@ export default async function Page() {
             </div>
             <p className="meta">Recent outcomes shown: {backtestRecent.slice(0, 20).length} of {backtestTotal} total (calibration uses up to 500 recent rows).</p>
           </>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Staggered 500 coverage</h2>
+        <p className="section-note">Full SPY universe, refreshed in slices of 50 so no run ever bursts the 60/min Finnhub free limit: quotes every ~50 minutes, technicals once a day pre-market. The 15-minute board above is still the shortlist scan, not this cache.</p>
+        {stagger ? (
+          <div className="cards">
+            <div className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Quotes refreshed (last 65 min)</div><div className="meta">{String(stagger.quotes_covered)} tickers · last {fmt(stagger.quotes_at)}</div></div>
+            <div className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Technicals refreshed (last 26 h)</div><div className="meta">{String(stagger.tech_covered)} tickers · last {fmt(stagger.tech_at)}</div></div>
+            {staggerState.map((s: AnyRow) => (
+              <div key={String(s.job)} className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Job: {String(s.job)}</div><div className="meta">last slice {String(s.slice)} · {fmt(s.updated_at)}</div></div>
+            ))}
+          </div>
+        ) : (
+          <p>No staggered runs recorded yet — set up the slice jobs in cron-job.org and coverage appears here.</p>
         )}
       </section>
 
