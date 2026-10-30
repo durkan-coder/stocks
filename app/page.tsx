@@ -10,6 +10,7 @@
 // shortlist, paper trades, recent scans.
 import { neon } from "@neondatabase/serverless";
 import ChatBox from "./components/ChatBox";
+import Tabs from "./components/Tabs";
 
 export const dynamic = "force-dynamic";
 
@@ -235,44 +236,7 @@ export default async function Page() {
   const leaders = sectorLeaders(board);
   const emptySectors = GICS_SECTORS.filter((s) => !leaders.has(s));
 
-  return (
-    <main className="page">
-      <style>{`
-        * { box-sizing: border-box; }
-        body { margin: 0; background: #f6f8fb; }
-        .page { max-width: 860px; margin: 0 auto; padding: 16px; font-family: system-ui, -apple-system, sans-serif; color: #202124; }
-        .page h1 { font-size: 26px; margin: 8px 0 4px; }
-        .subtitle { color: #5f6368; font-size: 14px; margin: 0 0 16px; line-height: 1.5; }
-        .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-        .status-card { background: #fff; border: 1px solid #e0e4ea; border-radius: 14px; padding: 12px 14px; }
-        .status-label { font-size: 12px; color: #5f6368; }
-        .status-value { font-size: 15px; font-weight: 650; margin-top: 4px; line-height: 1.3; }
-        .section { background: #fff; border: 1px solid #e0e4ea; border-radius: 18px; padding: 16px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .section h2 { font-size: 19px; margin: 0 0 4px; }
-        .section-note { color: #5f6368; font-size: 13px; margin: 0 0 12px; line-height: 1.5; }
-        .cards { display: flex; flex-direction: column; gap: 10px; }
-        .row-card { border: 1px solid #e8eaed; border-radius: 14px; padding: 12px 14px; background: #fbfcfe; }
-        .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
-        .ticker { font-size: 18px; font-weight: 750; }
-        .company { color: #5f6368; font-size: 12px; margin-top: 2px; }
-        .badge { font-size: 13px; font-weight: 700; white-space: nowrap; }
-        .price { font-size: 16px; font-weight: 650; margin-top: 8px; }
-        .meta { color: #5f6368; font-size: 13px; margin-top: 4px; line-height: 1.45; }
-        .detail { font-size: 14px; margin-top: 6px; line-height: 1.5; }
-        .footer { color: #5f6368; font-size: 13px; margin: 24px 0 8px; text-align: center; }
-        @media (min-width: 700px) {
-          .page { padding: 24px; }
-          .page h1 { font-size: 30px; }
-          .status-grid { grid-template-columns: repeat(3, 1fr); }
-          .cards { display: grid; grid-template-columns: repeat(2, 1fr); }
-        }
-      `}</style>
-
-      <h1>SPY Scanner</h1>
-      <p className="subtitle">
-        Potential 5%+ rise within 1 week · Scans every 15 minutes, 24/7 · Daily catalyst shortlist · Paper trades $100 each, sell at +5% / −3%
-      </p>
-
+  const overviewTab = (<>
       <div className="status-grid">
         {[
           ["Latest scan", latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "No scans yet"],
@@ -290,15 +254,32 @@ export default async function Page() {
           </div>
         ))}
       </div>
-
       <section className="section">
-        <h2>Ask about the scanner</h2>
-        <p className="section-note">
-          Ask why a ticker ranks where it does, why a trade was bought or skipped, or why a position closed. Answers use only today&apos;s board, shortlist and trades, via OpenRouter&apos;s free model — screening only, not financial advice.
-        </p>
-        <ChatBox />
+        <h2>Macro this week</h2>
+        <p className="section-note">Major US macro events in the coming 7 days (CPI, Fed/FOMC, jobs, GDP, retail). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst.</p>
+        {macro.length === 0 ? (
+          <p>No major macro events found for this week, or the weekly macro fetch failed.</p>
+        ) : (
+          <div className="cards">
+            {macro.map((ev: any, i: number) => (
+              <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
+                <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
+                <div className="meta">{fmt(ev.event_date)}</div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
+      <section className="section">
+        <h2>Live readiness — paper only</h2>
+        <p className="section-note">
+          Alpaca mode is paper only — the code refuses a non-paper URL, and live trading needs a separate explicit approval. Do not go live until: backtest hit rate is known (first outcomes Nov 2), paper trades have been validated end-to-end, and the take-profit/stop-loss job is re-enabled in cron-job.org (its status cannot be read from here — check it there).
+        </p>
+        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +5% / −3%.</div>
+      </section>
+    </>);
+  const boardTab = (<>
       <section className="section">
         <h2>Leaderboard — latest scan</h2>
         <p className="section-note">Ranked by score. A ticker only appears here with a named catalyst and reasoning — no catalyst, no row.</p>
@@ -354,6 +335,32 @@ export default async function Page() {
           </div>
         )}
       </section>
+    </>);
+  const shortlistTab = (<>
+      <section className="section">
+        <h2>Daily catalyst shortlist</h2>
+        <p className="section-note">The only universe the 15-minute scan covers. Rebuilt daily by /api/weekly: earnings plus each company&apos;s own guidance, product or regulatory news.</p>
+        {shortlist.length === 0 ? (
+          <p>No shortlist yet.</p>
+        ) : (
+          <div className="cards">
+            {shortlist.map((s: any) => (
+              <div key={s.ticker} className="row-card">
+                <div className="row-top">
+                  <div>
+                    <div className="ticker">{s.ticker} {s.is_new ? "🆕" : ""}</div>
+                    <div className="company">{s.company ?? ""}</div>
+                  </div>
+                  <div className="badge">{s.score}</div>
+                </div>
+                <div className="meta">{s.catalyst_type} · Event: {s.event_date ? fmt(s.event_date) : "—"}</div>
+                <div className="detail">{s.event_detail ?? ""}</div>
+                <div className="meta">{s.reasoning}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section className="section">
         <h2>LLM screen — top setups to watch</h2>
@@ -381,32 +388,8 @@ export default async function Page() {
           </div>
         )}
       </section>
-
-      <section className="section">
-        <h2>Daily catalyst shortlist</h2>
-        <p className="section-note">The only universe the 15-minute scan covers. Rebuilt daily by /api/weekly: earnings plus each company&apos;s own guidance, product or regulatory news.</p>
-        {shortlist.length === 0 ? (
-          <p>No shortlist yet.</p>
-        ) : (
-          <div className="cards">
-            {shortlist.map((s: any) => (
-              <div key={s.ticker} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">{s.ticker} {s.is_new ? "🆕" : ""}</div>
-                    <div className="company">{s.company ?? ""}</div>
-                  </div>
-                  <div className="badge">{s.score}</div>
-                </div>
-                <div className="meta">{s.catalyst_type} · Event: {s.event_date ? fmt(s.event_date) : "—"}</div>
-                <div className="detail">{s.event_detail ?? ""}</div>
-                <div className="meta">{s.reasoning}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
+    </>);
+  const tradesTab = (<>
       <section className="section">
         <h2>Paper trades — Alpaca paper only</h2>
         <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +5% or −3%. <a href="/positions">View positions →</a></p>
@@ -452,7 +435,8 @@ export default async function Page() {
           </div>
         )}
       </section>
-
+    </>);
+  const backtestTab = (<>
       <section className="section">
         <h2>Backtest — 7-day outcomes</h2>
         <p className="section-note">
@@ -509,7 +493,8 @@ export default async function Page() {
           </>
         )}
       </section>
-
+    </>);
+  const coverageTab = (<>
       <section className="section">
         <h2>Staggered 500 coverage</h2>
         <p className="section-note">Full SPY universe, refreshed in slices of 50 so no run ever bursts the 60/min Finnhub free limit: quotes every ~50 minutes, technicals once a day pre-market. The 15-minute board above is still the shortlist scan, not this cache.</p>
@@ -527,31 +512,6 @@ export default async function Page() {
       </section>
 
       <section className="section">
-        <h2>Macro this week</h2>
-        <p className="section-note">Major US macro events in the coming 7 days (CPI, Fed/FOMC, jobs, GDP, retail). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst.</p>
-        {macro.length === 0 ? (
-          <p>No major macro events found for this week, or the weekly macro fetch failed.</p>
-        ) : (
-          <div className="cards">
-            {macro.map((ev: any, i: number) => (
-              <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
-                <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
-                <div className="meta">{fmt(ev.event_date)}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="section">
-        <h2>Live readiness — paper only</h2>
-        <p className="section-note">
-          Alpaca mode is paper only — the code refuses a non-paper URL, and live trading needs a separate explicit approval. Do not go live until: backtest hit rate is known (first outcomes Nov 2), paper trades have been validated end-to-end, and the take-profit/stop-loss job is re-enabled in cron-job.org (its status cannot be read from here — check it there).
-        </p>
-        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +5% / −3%.</div>
-      </section>
-
-      <section className="section">
         <h2>Recent scans</h2>
         {scans.length === 0 ? (
           <p>No scans recorded yet.</p>
@@ -566,7 +526,64 @@ export default async function Page() {
           </div>
         )}
       </section>
-
+    </>);
+  const askTab = (<>
+      <section className="section">
+        <h2>Ask about the scanner</h2>
+        <p className="section-note">
+          Ask why a ticker ranks where it does, why a trade was bought or skipped, or why a position closed. Answers use only today&apos;s board, shortlist and trades, via OpenRouter&apos;s free model — screening only, not financial advice.
+        </p>
+        <ChatBox />
+      </section>
+    </>);
+  return (
+    <main className="page">
+      <style>{`
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #f6f8fb; }
+        .page { max-width: 860px; margin: 0 auto; padding: 16px; font-family: system-ui, -apple-system, sans-serif; color: #202124; }
+        .page h1 { font-size: 26px; margin: 8px 0 4px; }
+        .subtitle { color: #5f6368; font-size: 14px; margin: 0 0 16px; line-height: 1.5; }
+        .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .status-card { background: #fff; border: 1px solid #e0e4ea; border-radius: 14px; padding: 12px 14px; }
+        .status-label { font-size: 12px; color: #5f6368; }
+        .status-value { font-size: 15px; font-weight: 650; margin-top: 4px; line-height: 1.3; }
+        .section { background: #fff; border: 1px solid #e0e4ea; border-radius: 18px; padding: 16px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .section h2 { font-size: 19px; margin: 0 0 4px; }
+        .section-note { color: #5f6368; font-size: 13px; margin: 0 0 12px; line-height: 1.5; }
+        .cards { display: flex; flex-direction: column; gap: 10px; }
+        .row-card { border: 1px solid #e8eaed; border-radius: 14px; padding: 12px 14px; background: #fbfcfe; }
+        .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+        .ticker { font-size: 18px; font-weight: 750; }
+        .company { color: #5f6368; font-size: 12px; margin-top: 2px; }
+        .badge { font-size: 13px; font-weight: 700; white-space: nowrap; }
+        .price { font-size: 16px; font-weight: 650; margin-top: 8px; }
+        .meta { color: #5f6368; font-size: 13px; margin-top: 4px; line-height: 1.45; }
+        .detail { font-size: 14px; margin-top: 6px; line-height: 1.5; }
+        .footer { color: #5f6368; font-size: 13px; margin: 24px 0 8px; text-align: center; }
+        @media (min-width: 700px) {
+          .page { padding: 24px; }
+          .page h1 { font-size: 30px; }
+          .status-grid { grid-template-columns: repeat(3, 1fr); }
+          .cards { display: grid; grid-template-columns: repeat(2, 1fr); }
+        }
+      `}</style>
+      <h1>SPY Scanner</h1>
+      <p className="subtitle">
+        Potential 5%+ rise within 1 week · Scans every 15 minutes, 24/7 · Daily catalyst shortlist · Paper trades $100 each, sell at +5% / −3%
+      </p>
+      <Tabs
+        tabs={[
+          { id: "overview", label: "Overview", icon: "🏠", node: overviewTab },
+          { id: "board", label: "Board", icon: "📊", node: boardTab },
+          { id: "shortlist", label: "Shortlist", icon: "🎯", node: shortlistTab },
+          { id: "trades", label: "Trades", icon: "💼", node: tradesTab },
+          { id: "positions", label: "Positions", icon: "📈", href: "/positions" },
+          { id: "backtest", label: "Backtest", icon: "🧪", node: backtestTab },
+          { id: "coverage", label: "Coverage", icon: "🌐", node: coverageTab },
+          { id: "ask", label: "Ask", icon: "💬", node: askTab },
+        ]}
+      />
       <p className="footer">Screening only, not financial advice. Scores are not a guarantee of a 5% rise.</p>
     </main>
   );
