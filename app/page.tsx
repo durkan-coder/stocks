@@ -1,17 +1,13 @@
-// Dashboard page — mobile-first, iPhone-first.
-// Queries Neon directly (a relative fetch of /api/leaderboard fails on
-// the server with "Failed to parse URL from /api/leaderboard").
-// force-dynamic so every visit shows the latest scans, shortlist and
-// trades, not a build-time snapshot.
-//
-// Layout: one column on phones, cards instead of wide tables, so
-// nothing overflows horizontally and every area is its own visibly
-// separated section: status, chat, leaderboard, sector leaders,
-// shortlist, paper trades, recent scans.
 import { neon } from "@neondatabase/serverless";
-import ChatBox from "./components/ChatBox";
-import Tabs from "./components/Tabs";
+import { getPositions } from "@/lib/alpaca";
 
+// Portfolio home (Robinhood-style): positions first. This is the
+// app's home screen — the scanner dashboard lives at /scanner.
+// Top: total portfolio value + P/L. Below: a portfolio value chart
+// and per-position sparklines, built ONLY from real stored prices
+// (leaderboard scan prices since each purchase, never invented).
+// Then a tabular positions table (shares, entry, current, P/L,
+// take-profit, stop-loss) and a closed-positions table. Paper only.
 export const dynamic = "force-dynamic";
 
 type AnyRow = Record<string, any>;
@@ -24,567 +20,333 @@ async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
-async function getData() {
+function num(v: any): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtTime(v: any): string {
+  if (v === null || v === undefined) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  return d.toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function fmtDate(v: any): string {
+  if (v === null || v === undefined) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  return d.toLocaleDateString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric" });
+}
+
+function plColor(pct: number | null): string {
+  if (pct === null) return "#5f6368";
+  if (pct > 0.05) return "#137333";
+  if (pct < -0.05) return "#a50e0e";
+  return "#5f6368";
+}
+
+// SVG line + area path for a value series. X is by point order
+// (scans are ~15 min apart, so order ≈ time); Y is zoomed to the
+// series range, not zero-based — labelled as such on the chart,
+// so a small move is visible without implying a larger one.
+function chartPaths(values: number[], w: number, h: number, pad = 6): { line: string; area: string } {
+  if (values.length === 0) return { line: "", area: "" };
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  const px = (i: number) => (values.length === 1 ? w / 2 : pad + (i / (values.length - 1)) * (w - pad * 2));
+  const py = (v: number) => pad + (1 - (v - min) / (max - min)) * (h - pad * 2);
+  const line = values.map((v, i) => `${i === 0 ? "M" : "L"}${px(i).toFixed(1)},${py(v).toFixed(1)}`).join(" ");
+  const area = `${line} L${px(values.length - 1).toFixed(1)},${h} L${px(0).toFixed(1)},${h} Z`;
+  return { line, area };
+}
+
+export default async function PortfolioHome() {
   const sql = neon(process.env.DATABASE_URL!);
-  const scans = await safe(
-    () =>
-      sql`SELECT id, scanned_at, market_status, universe, notes FROM scans ORDER BY id DESC LIMIT 10`,
-    [] as AnyRow[],
-  );
-  const latestScan = scans[0] ?? null;
-  const board = latestScan
-    ? await safe(
-        () =>
-          sql`
-            SELECT rank, ticker, company, price, change_1d_pct, change_5d_pct,
-                   volume_ratio, score, catalyst, sentiment, reasoning, sources,
-                   confidence, target_pct
-            FROM leaderboard WHERE scan_id = ${latestScan.id} ORDER BY rank ASC
-          `,
-        [] as AnyRow[],
-      )
-    : [];
-  const shortlist = await safe(
-    () =>
-      sql`
-        SELECT ticker, company, catalyst_type, event_date, event_detail,
-               reasoning, score, sources, is_new, created_at
-        FROM weekly_shortlist
-        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM weekly_shortlist)
-        ORDER BY score DESC LIMIT 50
-      `,
-    [] as AnyRow[],
-  );
   const trades = await safe(
     () =>
       sql`
         SELECT week_start, ticker, leaderboard_rank, entry_price, notional_usd,
-               alpaca_order_id, status, exit_price, pnl_pct, opened_at, closed_at
-        FROM paper_trades ORDER BY opened_at DESC LIMIT 50
+               status, exit_price, pnl_pct, opened_at, closed_at
+        FROM paper_trades ORDER BY opened_at DESC
       `,
     [] as AnyRow[],
   );
-  const screen = await safe(
+
+  const liveByTicker = new Map<string, any>();
+  const live = await safe(() => getPositions(), [] as any[]);
+  for (const p of live) liveByTicker.set(p.symbol, p);
+
+  const cache = await safe(() => sql`SELECT ticker, price, updated_at FROM price_cache`, [] as AnyRow[]);
+  const cacheByTicker = new Map<string, AnyRow>();
+  for (const c of cache) cacheByTicker.set(c.ticker, c);
+
+  const board = await safe(
+    () => sql`SELECT ticker, price FROM leaderboard WHERE scan_id = (SELECT MAX(id) FROM scans)`,
+    [] as AnyRow[],
+  );
+  const boardByTicker = new Map<string, AnyRow>();
+  for (const b of board) boardByTicker.set(b.ticker, b);
+
+  // Scan-price history (last 3 days) for sparklines + portfolio chart.
+  const historyRows = await safe(
     () =>
       sql`
-        SELECT screen_date, rank, ticker, reason, catalyst_type, event_date,
-               rsi14, month_pct, volume_ratio, created_at
-        FROM llm_screen
-        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM llm_screen)
-        ORDER BY rank ASC LIMIT 5
+        SELECT s.scanned_at, l.ticker, l.price
+        FROM leaderboard l JOIN scans s ON s.id = l.scan_id
+        WHERE s.scanned_at > NOW() - INTERVAL '3 days'
+        ORDER BY s.scanned_at ASC
       `,
     [] as AnyRow[],
   );
-  const backtestAgg = await safe(
-    () =>
-      sql`
-        SELECT COUNT(*)::int AS total,
-               COALESCE(SUM(CASE WHEN hit_5 THEN 1 ELSE 0 END), 0)::int AS hits,
-               COALESCE(AVG(outcome_pct), 0) AS avg_outcome,
-               COALESCE(AVG(max_pct), 0) AS avg_max
-        FROM pick_outcomes
-      `,
-    [] as AnyRow[],
-  );
-  const backtestRecent = await safe(
-    () =>
-      sql`
-        SELECT scan_date, ticker, rank, score, entry_price, outcome_pct, max_pct, hit_5, catalyst_type
-        FROM pick_outcomes ORDER BY scan_date DESC, rank ASC LIMIT 500
-      `,
-    [] as AnyRow[],
-  );
-  const macro = await safe(
-    () =>
-      sql`
-        SELECT event_date, event, created_at
-        FROM macro_events
-        WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM macro_events)
-        ORDER BY event_date ASC LIMIT 20
-      `,
-    [] as AnyRow[],
-  );
-  const attempts = await safe(
-    () =>
-      sql`
-        SELECT job, scan_id, ticker, leaderboard_rank, outcome, detail, created_at
-        FROM trade_attempts ORDER BY created_at DESC LIMIT 10
-      `,
-    [] as AnyRow[],
-  );
-  // Separate safe queries: a single combined query fails entirely
-  // when either stagger table does not exist yet (e.g. quotes have
-  // run but daily has only ever 401'd, so ticker_technicals was
-  // never created), which would hide the quotes coverage too.
-  const staggerQuotes = await safe(
-    () => sql`SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM price_cache WHERE updated_at > NOW() - INTERVAL '65 minutes'`,
-    [] as AnyRow[],
-  );
-  const staggerTech = await safe(
-    () => sql`SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM ticker_technicals WHERE updated_at > NOW() - INTERVAL '26 hours'`,
-    [] as AnyRow[],
-  );
-  const stagger = [
-    {
-      quotes_covered: staggerQuotes[0]?.n ?? 0,
-      tech_covered: staggerTech[0]?.n ?? 0,
-      quotes_at: staggerQuotes[0]?.at ?? null,
-      tech_at: staggerTech[0]?.at ?? null,
-    },
-  ];
-  const staggerState = await safe(
-    () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
-    [] as AnyRow[],
-  );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro, attempts, stagger: stagger[0] ?? null, staggerState };
-}
 
-// GICS sector leaders: for each of the 11 official GICS sectors, the
-// highest-scoring ticker in the latest scan THAT ALREADY HAS a named
-// catalyst (every leaderboard row does, by construction). A sector
-// with no catalyst-backed ticker this scan is shown as empty —
-// never filled with a weak, catalyst-free row just to complete the
-// set, which would dilute the 5% screening signal.
-//
-// Sector mapping is a hardcoded ticker -> GICS sector table covering
-// the scanner's current universe and the usual large SPY names. It is
-// incomplete by design: tickers not in this map are simply not shown
-// as sector leaders, rather than guessed. When the live FMP
-// constituents list works again, sector should come from that list
-// (which carries a sector field per constituent) instead of this map.
-const GICS_SECTORS = [
-  "Information Technology",
-  "Financials",
-  "Communication Services",
-  "Health Care",
-  "Consumer Discretionary",
-  "Industrials",
-  "Consumer Staples",
-  "Energy",
-  "Utilities",
-  "Real Estate",
-  "Materials",
-] as const;
+  const open = trades.filter((t) => t.status === "open");
+  const closed = trades.filter((t) => t.status !== "open");
 
-const TICKER_SECTOR: Record<string, string> = {
-  NVDA: "Information Technology", AAPL: "Information Technology", MSFT: "Information Technology",
-  AVGO: "Information Technology", AMD: "Information Technology", INTC: "Information Technology",
-  CSCO: "Information Technology", ORCL: "Information Technology", CRM: "Information Technology",
-  JPM: "Financials", V: "Financials", MA: "Financials", BAC: "Financials", WFC: "Financials", GS: "Financials",
-  GOOGL: "Communication Services", GOOG: "Communication Services", META: "Communication Services",
-  NFLX: "Communication Services", DIS: "Communication Services", VZ: "Communication Services",
-  LLY: "Health Care", JNJ: "Health Care", ABBV: "Health Care", UNH: "Health Care", MRK: "Health Care",
-  AMZN: "Consumer Discretionary", TSLA: "Consumer Discretionary", HD: "Consumer Discretionary",
-  MCD: "Consumer Discretionary", BKNG: "Consumer Discretionary",
-  GE: "Industrials", CAT: "Industrials", RTX: "Industrials", HON: "Industrials", UNP: "Industrials",
-  BA: "Industrials", LMT: "Industrials", NOC: "Industrials",
-  WMT: "Consumer Staples", COST: "Consumer Staples", PG: "Consumer Staples", KO: "Consumer Staples", PEP: "Consumer Staples",
-  XOM: "Energy", CVX: "Energy", COP: "Energy", SLB: "Energy",
-  NEE: "Utilities", SO: "Utilities", DUK: "Utilities", CEG: "Utilities",
-  PLD: "Real Estate", AMT: "Real Estate", EQIX: "Real Estate", WELL: "Real Estate",
-  LIN: "Materials", SHW: "Materials", FCX: "Materials", ECL: "Materials",
-};
-
-function sectorLeaders(board: AnyRow[]) {
-  const leaders = new Map<string, AnyRow>();
-  for (const row of board) {
-    if (!row.catalyst) continue;
-    const sector = TICKER_SECTOR[row.ticker];
-    if (!sector) continue;
-    if (!leaders.has(sector)) leaders.set(sector, row);
-  }
-  return leaders;
-}
-
-function fmt(v: any) {
-  if (v === null || v === undefined) return "—";
-  if (v instanceof Date) return v.toISOString().replace("T", " ").slice(0, 16);
-  return String(v);
-}
-
-function scoreColor(confidence: string) {
-  if (confidence === "strong") return "#137333";
-  if (confidence === "notable") return "#b06000";
-  return "#5f6368";
-}
-
-export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro, attempts, stagger, staggerState } = await getData();
-  const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
-  const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
-  const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
-  const openTrades = trades.filter((t) => t.status === "open");
-  // Backtest calibration (ready for Nov 2 outcomes, honestly empty
-  // until then): hit rate by score bucket and by catalyst type, so
-  // score weights can be reweighted to what actually predicted a
-  // +5% hit instead of to what sounded plausible. Computed from
-  // pick_outcomes rows only — never from leaderboard scores alone.
-  const calibBucket = (label: string, rows: AnyRow[]) => ({
-    label,
-    total: rows.length,
-    hits: rows.filter((r) => r.hit_5).length,
+  const openRows = open.map((t) => {
+    const entry = num(t.entry_price);
+    const livePos = liveByTicker.get(t.ticker);
+    let current: number | null = null;
+    let plPct: number | null = null;
+    let source = "Entry only";
+    if (livePos) {
+      current = num(livePos.current_price);
+      const plpc = num(livePos.unrealized_plpc);
+      plPct = plpc === null ? null : plpc * 100;
+      source = "Live · Alpaca";
+    } else if (cacheByTicker.get(t.ticker) !== undefined) {
+      current = num(cacheByTicker.get(t.ticker)!.price);
+      if (entry !== null && current !== null) plPct = ((current - entry) / entry) * 100;
+      source = "Cached · staggered";
+    } else if (boardByTicker.get(t.ticker) !== undefined) {
+      current = num(boardByTicker.get(t.ticker)!.price);
+      if (entry !== null && current !== null) plPct = ((current - entry) / entry) * 100;
+      source = "Latest board";
+    }
+    const notional = num(t.notional_usd) ?? 100;
+    const shares = entry !== null && entry > 0 ? notional / entry : null;
+    const plUsd = plPct === null ? null : (plPct / 100) * notional;
+    const currentValue = current !== null && shares !== null ? shares * current : null;
+    const tp = entry === null ? null : entry * 1.05;
+    const sl = entry === null ? null : entry * 0.97;
+    // Sparkline: this ticker's scan prices since purchase.
+    const openedMs = new Date(t.opened_at).getTime();
+    const spark = historyRows
+      .filter((r) => r.ticker === t.ticker && num(r.price) !== null && new Date(r.scanned_at).getTime() >= openedMs)
+      .map((r) => num(r.price)!);
+    const sparkPoints = spark.length >= 2 ? spark : entry !== null && current !== null ? [entry, current] : spark;
+    return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints };
   });
-  const calibBuckets = [
-    calibBucket("Score ≥ 75 (strong)", backtestRecent.filter((r) => Number(r.score) >= 75)),
-    calibBucket("Score 60–74 (notable)", backtestRecent.filter((r) => Number(r.score) >= 60 && Number(r.score) < 75)),
-    calibBucket("Score < 60 (watch)", backtestRecent.filter((r) => Number(r.score) < 60)),
-  ];
-  const calibByCatalyst = [...new Map(backtestRecent.map((r) => [r.catalyst_type ?? "unknown", true])).keys()].map((cat) =>
-    calibBucket(String(cat), backtestRecent.filter((r) => (r.catalyst_type ?? "unknown") === cat)),
-  );
-  const newToday = shortlist.filter((s) => s.is_new).length;
-  const leaders = sectorLeaders(board);
-  const emptySectors = GICS_SECTORS.filter((s) => !leaders.has(s));
 
-  const overviewTab = (<>
-      <div className="status-grid">
-        {[
-          ["Latest scan", latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "No scans yet"],
-          ["Leaderboard rows", String(board.length)],
-          ["Daily shortlist", shortlist.length ? `${shortlist.length} tickers · ${newToday} new · ${fmt(shortlist[0].created_at)}` : "No shortlist yet"],
-          ["Paper trades open", String(openTrades.length)],
-          ["Sector leaders", `${leaders.size} of 11 sectors`],
-          ["LLM screen", screen.length ? `${screen.length} setups · ${fmt(screen[0].created_at)}` : "No screen yet"],
-          ["Backtest hit rate", backtestRate !== null ? `${backtestRate.toFixed(1)}% (${backtestHits}/${backtestTotal})` : "No 7-day outcomes yet"],
-          ["Scans shown", String(scans.length ? `${scans.length} (latest 10)` : "0")],
-        ].map(([label, value]) => (
-          <div key={label} className="status-card">
-            <div className="status-label">{label}</div>
-            <div className="status-value">{value}</div>
-          </div>
-        ))}
-      </div>
-      <section className="section">
-        <h2>Macro this week</h2>
-        <p className="section-note">Major US macro events in the coming 7 days (CPI, Fed/FOMC, jobs, GDP, retail). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst.</p>
-        {macro.length === 0 ? (
-          <p>No major macro events found for this week, or the weekly macro fetch failed.</p>
-        ) : (
-          <div className="cards">
-            {macro.map((ev: any, i: number) => (
-              <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
-                <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
-                <div className="meta">{fmt(ev.event_date)}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+  // Portfolio value series: at each scan time, sum shares × latest
+  // scan price (carried forward) over positions opened by then.
+  const portfolioSeries: { time: any; value: number }[] = [];
+  if (openRows.length > 0) {
+    const times = [...new Set(historyRows.map((r) => new Date(r.scanned_at).getTime()))].sort((a, b) => a - b);
+    const lastPrice = new Map<string, number>();
+    for (const ms of times) {
+      for (const r of historyRows) {
+        if (new Date(r.scanned_at).getTime() === ms && num(r.price) !== null) lastPrice.set(r.ticker, num(r.price)!);
+      }
+      let value = 0;
+      let any = false;
+      for (const row of openRows) {
+        if (row.shares === null) continue;
+        if (new Date(row.t.opened_at).getTime() > ms) continue;
+        const p = lastPrice.get(row.t.ticker) ?? row.entry;
+        if (p === null) continue;
+        value += row.shares * p;
+        any = true;
+      }
+      if (any) portfolioSeries.push({ time: new Date(ms), value });
+    }
+    // Ensure the series ends at today's live value.
+    const liveTotal = openRows.reduce((s, r) => s + (r.currentValue ?? 0), 0);
+    if (portfolioSeries.length > 0 && liveTotal > 0) {
+      portfolioSeries.push({ time: new Date(), value: liveTotal });
+    }
+  }
 
-      <section className="section">
-        <h2>Live readiness — paper only</h2>
-        <p className="section-note">
-          Alpaca mode is paper only — the code refuses a non-paper URL, and live trading needs a separate explicit approval. Do not go live until: backtest hit rate is known (first outcomes Nov 2), paper trades have been validated end-to-end, and the take-profit/stop-loss job is re-enabled in cron-job.org (its status cannot be read from here — check it there).
-        </p>
-        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +5% / −3%.</div>
-      </section>
-    </>);
-  const boardTab = (<>
-      <section className="section">
-        <h2>Leaderboard — latest scan</h2>
-        <p className="section-note">Ranked by score. A ticker only appears here with a named catalyst and reasoning — no catalyst, no row.</p>
-        {board.length === 0 ? (
-          <p>No candidates in the latest scan. A scan with no verified catalyst produces no rows, rather than invented picks.</p>
-        ) : (
-          <div className="cards">
-            {board.map((r: any) => (
-              <div key={r.ticker} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">#{r.rank} {r.ticker}</div>
-                    <div className="company">{r.company ?? ""}</div>
-                  </div>
-                  <div className="badge" style={{ color: scoreColor(r.confidence) }}>{r.score} · {r.confidence}</div>
-                </div>
-                <div className="price">${r.price ?? "—"}</div>
-                <div className="meta">1d {r.change_1d_pct ?? "—"}% · 5d {r.change_5d_pct ?? "—"} · Sentiment: {r.sentiment ?? "—"}</div>
-                <div className="detail">{r.catalyst ?? "—"}</div>
-                <div className="meta">{r.reasoning}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+  const invested = openRows.reduce((s, r) => s + r.notional, 0);
+  const currentTotal = openRows.reduce((s, r) => s + (r.currentValue ?? 0), 0);
+  const totalPlUsd = openRows.reduce((s, r) => s + (r.plUsd ?? 0), 0);
+  const totalPlPct = invested > 0 ? (totalPlUsd / invested) * 100 : null;
+  const closedPlUsd = closed.reduce((s, t) => {
+    const pct = num(t.pnl_pct);
+    const notional = num(t.notional_usd) ?? 100;
+    return s + (pct === null ? 0 : (pct / 100) * notional);
+  }, 0);
 
-      <section className="section">
-        <h2>Sector leaders</h2>
-        <p className="section-note">
-          Best catalyst-backed ticker per GICS sector. {leaders.size} of 11 sectors covered this scan.
-          {emptySectors.length > 0 ? ` No leader for: ${emptySectors.join(", ")} — those sectors had no catalyst-backed ticker, so nothing is invented to fill them.` : ""}
-        </p>
-        {leaders.size === 0 ? (
-          <p>No sector leaders in the latest scan.</p>
-        ) : (
-          <div className="cards">
-            {GICS_SECTORS.filter((s) => leaders.has(s)).map((sector) => {
-              const r: any = leaders.get(sector);
-              return (
-                <div key={sector} className="row-card">
-                  <div className="row-top">
-                    <div>
-                      <div className="ticker">{r.ticker}</div>
-                      <div className="company">{sector} · {r.company ?? ""}</div>
-                    </div>
-                    <div className="badge" style={{ color: scoreColor(r.confidence) }}>{r.score} · {r.confidence}</div>
-                  </div>
-                  <div className="price">${r.price ?? "—"}</div>
-                  <div className="detail">{r.catalyst ?? "—"}</div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-    </>);
-  const shortlistTab = (<>
-      <section className="section">
-        <h2>Daily catalyst shortlist</h2>
-        <p className="section-note">The only universe the 15-minute scan covers. Rebuilt daily by /api/weekly: earnings plus each company&apos;s own guidance, product or regulatory news.</p>
-        {shortlist.length === 0 ? (
-          <p>No shortlist yet.</p>
-        ) : (
-          <div className="cards">
-            {shortlist.map((s: any) => (
-              <div key={s.ticker} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">{s.ticker} {s.is_new ? "🆕" : ""}</div>
-                    <div className="company">{s.company ?? ""}</div>
-                  </div>
-                  <div className="badge">{s.score}</div>
-                </div>
-                <div className="meta">{s.catalyst_type} · Event: {s.event_date ? fmt(s.event_date) : "—"}</div>
-                <div className="detail">{s.event_detail ?? ""}</div>
-                <div className="meta">{s.reasoning}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+  const chartValues = portfolioSeries.map((p) => p.value);
+  const chart = chartPaths(chartValues, 600, 180);
+  const chartColor = (totalPlPct ?? 0) >= 0 ? "#137333" : "#a50e0e";
+  const chartMin = chartValues.length ? Math.min(...chartValues) : 0;
+  const chartMax = chartValues.length ? Math.max(...chartValues) : 0;
 
-      <section className="section">
-        <h2>LLM screen — top setups to watch</h2>
-        <p className="section-note">
-          Our LLM (OpenRouter free model, not Gemini) ranks up to 5 candidates from the daily shortlist, using only verified data: upcoming catalyst, RSI(14), month trend, volume and historical volatility. Research screen only — not a prediction, not a buy recommendation, and it does not change leaderboard scores or paper trades.
-        </p>
-        {screen.length === 0 ? (
-          <p>No LLM screen yet. It is written by the daily /api/weekly rebuild, and is empty if that run&apos;s LLM call failed — never a fabricated list.</p>
-        ) : (
-          <div className="cards">
-            {screen.map((s: any) => (
-              <div key={s.ticker} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">#{s.rank} {s.ticker}</div>
-                    <div className="company">{s.catalyst_type ?? ""}{s.event_date ? ` · Event ${fmt(s.event_date)}` : ""}</div>
-                  </div>
-                </div>
-                <div className="detail">{s.reason}</div>
-                <div className="meta">
-                  RSI(14) {s.rsi14 ?? "—"} · Month {s.month_pct ?? "—"}% · Volume {s.volume_ratio ?? "—"}x avg
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </>);
-  const tradesTab = (<>
-      <section className="section">
-        <h2>Paper trades — Alpaca paper only</h2>
-        <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +5% or −3%. <a href="/positions">View positions →</a></p>
-        {trades.length === 0 ? (
-          <p>No paper trades yet.</p>
-        ) : (
-          <div className="cards">
-            {trades.map((t: any, i: number) => (
-              <div key={`${t.ticker}-${i}`} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">{t.ticker}</div>
-                    <div className="company">Week of {fmt(t.week_start)} · Rank {t.leaderboard_rank ?? "—"}</div>
-                  </div>
-                  <div className="badge">{t.status}</div>
-                </div>
-                <div className="meta">Entry {t.entry_price ?? "—"} (${t.notional_usd}) · Exit {t.exit_price ?? "—"} · P&amp;L {t.pnl_pct ?? "—"}</div>
-                <div className="meta">Opened {fmt(t.opened_at)}{t.closed_at ? ` · Closed ${fmt(t.closed_at)}` : ""}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="section">
-        <h2>Daily buy attempts — recorded runs</h2>
-        <p className="section-note">Every /api/trade/daily run writes a row here, even when it buys nothing — so a missing row means the cron job never reached the app, while a row with an outcome shows exactly where it stopped. No secrets are stored in these rows.</p>
-        {attempts.length === 0 ? (
-          <p>No daily buy attempts recorded yet. Attempts are only written by runs on the deployed code from Oct 30 onward — earlier runs left no row, which is why their cause is still unproven.</p>
-        ) : (
-          <div className="cards">
-            {attempts.map((a: any, i: number) => (
-              <div key={`${a.created_at}-${i}`} className="row-card">
-                <div className="row-top">
-                  <div>
-                    <div className="ticker">{a.outcome}</div>
-                    <div className="company">{a.ticker ? `${a.ticker} · Rank ${a.leaderboard_rank ?? "—"}` : "no ticker"} · Scan {a.scan_id ?? "—"}</div>
-                  </div>
-                </div>
-                <div className="meta">{fmt(a.created_at)}{a.detail ? ` · ${a.detail}` : ""}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </>);
-  const backtestTab = (<>
-      <section className="section">
-        <h2>Backtest — 7-day outcomes</h2>
-        <p className="section-note">
-          For each pick, did it reach +5% within 7 days (daily high vs entry price)? Written daily by /api/backtest for picks from 7 days ago. First outcomes land Nov 2, since scans began Oct 26 — until then this section is honestly empty, not a fabricated hit rate.
-        </p>
-        {backtestTotal === 0 ? (
-          <p>No 7-day outcomes yet.</p>
-        ) : (
-          <>
-            <p style={{ fontSize: 15 }}>
-              Hit rate: <strong>{backtestRate?.toFixed(1)}%</strong> ({backtestHits}/{backtestTotal} picks) ·
-              Avg outcome {Number(backtestAgg.avg_outcome).toFixed(1)}% · Avg max rise {Number(backtestAgg.avg_max).toFixed(1)}%
-            </p>
-            <div className="cards">
-              {backtestRecent.map((o: any, i: number) => (
-                <div key={`${o.scan_date}-${o.ticker}-${i}`} className="row-card">
-                  <div className="row-top">
-                    <div>
-                      <div className="ticker">{o.ticker}</div>
-                      <div className="company">Pick {fmt(o.scan_date)} · Rank {o.rank} · Score {o.score}</div>
-                    </div>
-                    <div className="badge" style={{ color: o.hit_5 ? "#137333" : "#5f6368" }}>{o.hit_5 ? "HIT +5%" : "miss"}</div>
-                  </div>
-                  <div className="meta">Entry {o.entry_price} · 7-day close {Number(o.outcome_pct).toFixed(1)}% · Max rise {Number(o.max_pct).toFixed(1)}%</div>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-      </section>
-
-      <section className="section">
-        <h2>Backtest calibration — what actually predicted +5%</h2>
-        <p className="section-note">Hit rate by score bucket and by catalyst type, from recorded 7-day outcomes only. Use this, not intuition, to reweight the score: a bucket that hits rarely should not outrank one that hits often. Empty until the first outcomes land Nov 2.</p>
-        {backtestTotal === 0 ? (
-          <p>No 7-day outcomes yet — calibration appears with the first outcomes.</p>
-        ) : (
-          <>
-            <div className="cards">
-              {calibBuckets.map((b) => (
-                <div key={b.label} className="row-card">
-                  <div className="ticker" style={{ fontSize: 15 }}>{b.label}</div>
-                  <div className="meta">{b.total ? `${((b.hits / b.total) * 100).toFixed(1)}% hit rate · ${b.hits}/${b.total} picks` : "no picks"}</div>
-                </div>
-              ))}
-              {calibByCatalyst.map((b) => (
-                <div key={`cat-${b.label}`} className="row-card">
-                  <div className="ticker" style={{ fontSize: 15 }}>Catalyst: {b.label}</div>
-                  <div className="meta">{b.total ? `${((b.hits / b.total) * 100).toFixed(1)}% hit rate · ${b.hits}/${b.total} picks` : "no picks"}</div>
-                </div>
-              ))}
-            </div>
-            <p className="meta">Recent outcomes shown: {backtestRecent.slice(0, 20).length} of {backtestTotal} total (calibration uses up to 500 recent rows).</p>
-          </>
-        )}
-      </section>
-    </>);
-  const coverageTab = (<>
-      <section className="section">
-        <h2>Staggered 500 coverage</h2>
-        <p className="section-note">Full SPY universe, refreshed in slices of 50 so no run ever bursts the 60/min Finnhub free limit: quotes every ~50 minutes, technicals once a day pre-market. The 15-minute board above is still the shortlist scan, not this cache.</p>
-        {stagger ? (
-          <div className="cards">
-            <div className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Quotes refreshed (last 65 min)</div><div className="meta">{String(stagger.quotes_covered)} tickers · last {fmt(stagger.quotes_at)}</div></div>
-            <div className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Technicals refreshed (last 26 h)</div><div className="meta">{String(stagger.tech_covered)} tickers · last {fmt(stagger.tech_at)}</div></div>
-            {staggerState.map((s: AnyRow) => (
-              <div key={String(s.job)} className="row-card"><div className="ticker" style={{ fontSize: 15 }}>Job: {String(s.job)}</div><div className="meta">last slice {String(s.slice)} · {fmt(s.updated_at)}</div></div>
-            ))}
-          </div>
-        ) : (
-          <p>No staggered runs recorded yet — set up the slice jobs in cron-job.org and coverage appears here.</p>
-        )}
-      </section>
-
-      <section className="section">
-        <h2>Recent scans</h2>
-        {scans.length === 0 ? (
-          <p>No scans recorded yet.</p>
-        ) : (
-          <div className="cards">
-            {scans.map((s: any) => (
-              <div key={s.id} className="row-card">
-                <div className="ticker" style={{ fontSize: 15 }}>{fmt(s.scanned_at)}</div>
-                <div className="meta">{s.market_status} · {s.universe}{s.notes ? ` · ${s.notes}` : ""}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </>);
-  const askTab = (<>
-      <section className="section">
-        <h2>Ask about the scanner</h2>
-        <p className="section-note">
-          Ask why a ticker ranks where it does, why a trade was bought or skipped, or why a position closed. Answers use only today&apos;s board, shortlist and trades, via OpenRouter&apos;s free model — screening only, not financial advice.
-        </p>
-        <ChatBox />
-      </section>
-    </>);
   return (
     <main className="page">
       <style>{`
         * { box-sizing: border-box; }
-        body { margin: 0; background: #f6f8fb; }
-        .page { max-width: 860px; margin: 0 auto; padding: 16px; font-family: system-ui, -apple-system, sans-serif; color: #202124; }
-        .page h1 { font-size: 26px; margin: 8px 0 4px; }
-        .subtitle { color: #5f6368; font-size: 14px; margin: 0 0 16px; line-height: 1.5; }
-        .status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-        .status-card { background: #fff; border: 1px solid #e0e4ea; border-radius: 14px; padding: 12px 14px; }
-        .status-label { font-size: 12px; color: #5f6368; }
-        .status-value { font-size: 15px; font-weight: 650; margin-top: 4px; line-height: 1.3; }
-        .section { background: #fff; border: 1px solid #e0e4ea; border-radius: 18px; padding: 16px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .section h2 { font-size: 19px; margin: 0 0 4px; }
-        .section-note { color: #5f6368; font-size: 13px; margin: 0 0 12px; line-height: 1.5; }
-        .cards { display: flex; flex-direction: column; gap: 10px; }
-        .row-card { border: 1px solid #e8eaed; border-radius: 14px; padding: 12px 14px; background: #fbfcfe; }
-        .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
-        .ticker { font-size: 18px; font-weight: 750; }
-        .company { color: #5f6368; font-size: 12px; margin-top: 2px; }
-        .badge { font-size: 13px; font-weight: 700; white-space: nowrap; }
-        .price { font-size: 16px; font-weight: 650; margin-top: 8px; }
+        body { margin: 0; background: #fff; }
+        .page { max-width: 860px; margin: 0 auto; padding: 16px 16px 96px; font-family: system-ui, -apple-system, sans-serif; color: #202124; }
+        .topnav { display: none; gap: 18px; font-size: 14px; margin: 4px 0 16px; }
+        .topnav a { color: #5f6368; text-decoration: none; }
+        .topnav a.active { color: #202124; font-weight: 700; }
+        .hero-label { font-size: 13px; color: #5f6368; }
+        .hero-value { font-size: 38px; font-weight: 800; margin: 2px 0 0; line-height: 1.1; }
+        .hero-pl { font-size: 16px; font-weight: 700; margin-top: 4px; }
+        .card { background: #fff; border: 1px solid #e0e4ea; border-radius: 18px; padding: 16px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .card h2 { font-size: 17px; margin: 0 0 4px; }
+        .note { color: #5f6368; font-size: 12px; margin: 6px 0 0; line-height: 1.5; }
         .meta { color: #5f6368; font-size: 13px; margin-top: 4px; line-height: 1.45; }
-        .detail { font-size: 14px; margin-top: 6px; line-height: 1.5; }
+        .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 16px; }
+        .stat { background: #f6f8fb; border-radius: 12px; padding: 10px 12px; }
+        .stat-label { font-size: 12px; color: #5f6368; }
+        .stat-value { font-size: 15px; font-weight: 700; margin-top: 2px; }
+        .table-wrap { overflow-x: auto; margin: 12px -16px 0; padding: 0 16px; }
+        table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13px; }
+        th { text-align: left; color: #5f6368; font-weight: 600; padding: 8px 10px 8px 0; border-bottom: 1px solid #e0e4ea; white-space: nowrap; }
+        td { padding: 10px 10px 10px 0; border-bottom: 1px solid #f0f2f5; white-space: nowrap; vertical-align: middle; }
+        td.ticker, th.ticker { font-weight: 750; font-size: 14px; }
+        .bottom-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex; background: #fff; border-top: 1px solid #e0e4ea; padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); box-shadow: 0 -1px 6px rgba(0,0,0,0.06); }
+        .bottom-nav a { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 2px; font-size: 10px; color: #5f6368; text-decoration: none; }
+        .bottom-nav a.active { color: #0b1f3a; font-weight: 700; }
+        .bottom-nav .nav-icon { font-size: 18px; line-height: 1; }
         .footer { color: #5f6368; font-size: 13px; margin: 24px 0 8px; text-align: center; }
         @media (min-width: 700px) {
-          .page { padding: 24px; }
-          .page h1 { font-size: 30px; }
-          .status-grid { grid-template-columns: repeat(3, 1fr); }
-          .cards { display: grid; grid-template-columns: repeat(2, 1fr); }
+          .page { padding: 24px 24px 32px; }
+          .topnav { display: flex; }
+          .bottom-nav { display: none; }
+          .stats { grid-template-columns: repeat(4, 1fr); }
+          .hero-value { font-size: 44px; }
         }
       `}</style>
-      <h1>SPY Scanner</h1>
-      <p className="subtitle">
-        Potential 5%+ rise within 1 week · Scans every 15 minutes, 24/7 · Daily catalyst shortlist · Paper trades $100 each, sell at +5% / −3%
-      </p>
-      <Tabs
-        tabs={[
-          { id: "overview", label: "Overview", icon: "🏠", node: overviewTab },
-          { id: "board", label: "Board", icon: "📊", node: boardTab },
-          { id: "shortlist", label: "Shortlist", icon: "🎯", node: shortlistTab },
-          { id: "trades", label: "Trades", icon: "💼", node: tradesTab },
-          { id: "positions", label: "Positions", icon: "📈", href: "/positions" },
-          { id: "backtest", label: "Backtest", icon: "🧪", node: backtestTab },
-          { id: "coverage", label: "Coverage", icon: "🌐", node: coverageTab },
-          { id: "ask", label: "Ask", icon: "💬", node: askTab },
-        ]}
-      />
-      <p className="footer">Screening only, not financial advice. Scores are not a guarantee of a 5% rise.</p>
+
+      <nav className="topnav">
+        <a className="active" href="/">🏠 Portfolio</a>
+        <a href="/scanner">🔍 Scanner</a>
+        <a href="/scanner#board">📊 Board</a>
+        <a href="/scanner#trades">💼 Trades</a>
+        <a href="/scanner#ask">💬 Ask</a>
+      </nav>
+
+      <div className="hero-label">Portfolio value · Paper only</div>
+      <div className="hero-value">${currentTotal.toFixed(2)}</div>
+      <div className="hero-pl" style={{ color: plColor(totalPlPct) }}>
+        {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) today / since purchase`}
+      </div>
+      <div className="meta">Invested ${invested.toFixed(2)} across {open.length} open position{open.length === 1 ? "" : "s"} · Closed P/L ${closedPlUsd >= 0 ? "+" : "−"}$${Math.abs(closedPlUsd).toFixed(2)}</div>
+
+      <section className="card">
+        <h2>Portfolio over time</h2>
+        {chartValues.length < 2 ? (
+          <p className="meta">Not enough scan prices yet to draw a chart — it appears once the position has scan prices after purchase.</p>
+        ) : (
+          <>
+            <svg viewBox="0 0 600 180" width="100%" height="180" role="img" aria-label="Portfolio value chart">
+              <path d={chart.area} fill={chartColor} opacity="0.12" />
+              <path d={chart.line} fill="none" stroke={chartColor} strokeWidth="2.5" strokeLinejoin="round" />
+            </svg>
+            <div className="meta">
+              {fmtTime(portfolioSeries[0]?.time)} → {fmtTime(portfolioSeries[portfolioSeries.length - 1]?.time)} · Range ${chartMin.toFixed(2)} – ${chartMax.toFixed(2)} · Chart zoomed to range, not zero-based.
+            </div>
+          </>
+        )}
+        <p className="note">Built from leaderboard scan prices since each purchase. A position bought today starts at its entry value; earlier scan prices are not backfilled as if you had owned it.</p>
+      </section>
+
+      <div className="stats">
+        <div className="stat"><div className="stat-label">Invested</div><div className="stat-value">${invested.toFixed(2)}</div></div>
+        <div className="stat"><div className="stat-label">Current value</div><div className="stat-value">${currentTotal.toFixed(2)}</div></div>
+        <div className="stat"><div className="stat-label">Open P/L</div><div className="stat-value" style={{ color: plColor(totalPlPct) }}>{totalPlPct === null ? "—" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)}`}</div></div>
+        <div className="stat"><div className="stat-label">Open positions</div><div className="stat-value">{open.length}</div></div>
+      </div>
+
+      <section className="card">
+        <h2>Open positions</h2>
+        {openRows.length === 0 ? (
+          <p className="meta">No open paper positions. The next daily buy runs on the next weekday at 06:52 PDT, subject to the score and fall guards.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Take profit</th><th>Stop loss</th></tr>
+              </thead>
+              <tbody>
+                {openRows.map((r) => {
+                  const spark = chartPaths(r.spark, 100, 32, 2);
+                  const sparkColor = (r.plPct ?? 0) >= 0 ? "#137333" : "#a50e0e";
+                  return (
+                    <tr key={r.t.ticker}>
+                      <td className="ticker">{r.t.ticker}<div className="meta" style={{ marginTop: 0 }}>{r.source}</div></td>
+                      <td>
+                        {r.spark.length >= 2 ? (
+                          <svg viewBox="0 0 100 32" width="100" height="32"><path d={spark.line} fill="none" stroke={sparkColor} strokeWidth="2" strokeLinejoin="round" /></svg>
+                        ) : "—"}
+                      </td>
+                      <td>{r.shares === null ? "—" : r.shares.toFixed(4)}</td>
+                      <td>${r.entry === null ? "—" : r.entry.toFixed(2)}</td>
+                      <td>${r.current === null ? "—" : r.current.toFixed(2)}</td>
+                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plUsd === null ? "—" : `${r.plUsd >= 0 ? "+" : "−"}$${Math.abs(r.plUsd).toFixed(2)}`}</td>
+                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plPct === null ? "—" : `${r.plPct >= 0 ? "+" : ""}${r.plPct.toFixed(2)}%`}</td>
+                      <td>${r.tp === null ? "—" : r.tp.toFixed(2)}</td>
+                      <td>${r.sl === null ? "—" : r.sl.toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="note">Sell rule: +5% take profit, −3% stop loss, checked every 15 minutes. A gap at the open can close beyond −3% — the stop limits, but does not guarantee, the loss.</p>
+      </section>
+
+      <section className="card">
+        <h2>Closed positions</h2>
+        {closed.length === 0 ? (
+          <p className="meta">No closed paper positions yet.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th className="ticker">Stock</th><th>Entry</th><th>Exit</th><th>P/L $</th><th>P/L %</th><th>Status</th><th>Closed</th></tr>
+              </thead>
+              <tbody>
+                {closed.map((t: any, i: number) => {
+                  const pct = num(t.pnl_pct);
+                  const notional = num(t.notional_usd) ?? 100;
+                  const usd = pct === null ? null : (pct / 100) * notional;
+                  return (
+                    <tr key={`${t.ticker}-${i}`}>
+                      <td className="ticker">{t.ticker}</td>
+                      <td>{t.entry_price ?? "—"}</td>
+                      <td>{t.exit_price ?? "—"}</td>
+                      <td style={{ color: plColor(pct), fontWeight: 700 }}>{usd === null ? "—" : `${usd >= 0 ? "+" : "−"}$${Math.abs(usd).toFixed(2)}`}</td>
+                      <td style={{ color: plColor(pct), fontWeight: 700 }}>{pct === null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</td>
+                      <td>{t.status}</td>
+                      <td>{fmtDate(t.closed_at)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <nav className="bottom-nav">
+        <a className="active" href="/"><span className="nav-icon">🏠</span>Portfolio</a>
+        <a href="/scanner"><span className="nav-icon">🔍</span>Scanner</a>
+        <a href="/scanner#board"><span className="nav-icon">📊</span>Board</a>
+        <a href="/scanner#ask"><span className="nav-icon">💬</span>Ask</a>
+      </nav>
+
+      <p className="footer">Paper trading only — not real money, screening only, not financial advice. <a href="/scanner">Open the scanner →</a></p>
     </main>
   );
 }
