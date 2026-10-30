@@ -152,7 +152,9 @@ export default async function PositionsPage() {
         }
       `}</style>
 
-      <p className="back"><a href="/">← Back to dashboard</a></p>
+      <p className="back">
+        <a href="/#overview">🏠 Overview</a> · <a href="/#board">📊 Board</a> · <a href="/#shortlist">🎯 Shortlist</a> · <a href="/#trades">💼 Trades</a> · <strong>📈 Positions</strong> · <a href="/#backtest">🧪 Backtest</a> · <a href="/#coverage">🌐 Coverage</a> · <a href="/#ask">💬 Ask</a>
+      </p>
       <h1>Positions — paper only</h1>
       <p className="subtitle">
         Every paper trade, $100 each. Open positions show live profit/loss; closed positions show the realised result. Sell rule: +5% take profit, −3% stop loss, checked every 15 minutes.
