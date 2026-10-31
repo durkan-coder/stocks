@@ -111,6 +111,10 @@ export default async function PortfolioHome() {
   // Human-in-the-loop: today's pending proposal, approval mode,
   // and recent proposal history. Tables are created by the trade
   // routes; if they do not exist yet, these fall back to empty.
+  // PIN status only (never the value): whether APPROVAL_PIN is set
+  // in Vercel. If it is not set, approve/reject/toggle are blocked
+  // server-side until the user sets it and redeploys.
+  const pinConfigured = Boolean(process.env.APPROVAL_PIN);
   let approvalOn = true;
   try {
     await sql`CREATE TABLE IF NOT EXISTS trade_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
@@ -306,8 +310,14 @@ export default async function PortfolioHome() {
             : "The daily run buys directly, as before."}{" "}
           Sells are always automatic at +5% / −3% — waiting to approve a stop could let a gain reverse or a loss deepen.
         </p>
-        <form method="post" action="/api/trade/settings" style={{ marginTop: 10 }}>
+        {!pinConfigured && (
+          <p className="meta" style={{ color: "#a50e0e", fontWeight: 700 }}>
+            ⚠️ Approval PIN is not set yet — approve, reject and toggle are blocked until you set APPROVAL_PIN in Vercel (Settings → Environment Variables, any 4–8 digit code you choose, different from CRON_SECRET, never shared in chat) and redeploy. Approvals will not work until then, by design.
+          </p>
+        )}
+        <form method="post" action="/api/trade/settings" style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <input type="hidden" name="value" value={approvalOn ? "off" : "on"} />
+          <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
           <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #0b1f3a", background: "#0b1f3a", color: "#fff", fontSize: 14, cursor: "pointer" }}>
             Turn approval {approvalOn ? "OFF" : "ON"}
           </button>
@@ -332,15 +342,17 @@ export default async function PortfolioHome() {
               {Number(proposal.score) < 60 ? "Score is watch-range (< 60), not strong. " : ""}
               Approval executes at the current market price for $100 notional — the proposal price is a reference, not a limit. Guards are re-checked at approval (score ≥ 50, 1-day fall &gt; −5%); if it now fails, no order is placed.
             </div>
-            <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-              <form method="post" action="/api/trade/approve">
+            <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+              <form method="post" action="/api/trade/approve" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
                 <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "none", background: "#137333", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
                   ✓ Approve buy
                 </button>
               </form>
-              <form method="post" action="/api/trade/reject">
+              <form method="post" action="/api/trade/reject" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
                 <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "1px solid #a50e0e", background: "#fff", color: "#a50e0e", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
                   ✕ Reject
                 </button>
