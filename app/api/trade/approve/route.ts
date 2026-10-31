@@ -1,6 +1,7 @@
 import { neon } from "@neondatabase/serverless";
 import { NextRequest, NextResponse } from "next/server";
 import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
+import { isPinValid } from "@/lib/approvalPin";
 
 // Approve a pending trade proposal (human-in-the-loop buy).
 // Called from the portfolio home's Approve button (a plain form
@@ -23,18 +24,26 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   const sql = neon(process.env.DATABASE_URL!);
   let proposalId: number | null = null;
+  let pin: string | null = null;
   try {
     const form = await req.formData();
     proposalId = Number(form.get("proposalId"));
+    pin = form.get("pin") ? String(form.get("pin")) : null;
   } catch {
     try {
       const body = await req.json();
       proposalId = Number(body.proposalId);
+      pin = body.pin ? String(body.pin) : null;
     } catch {
       proposalId = null;
     }
   }
   const home = new URL("/", req.url);
+  // PIN gate, before any trade action: fail closed if APPROVAL_PIN
+  // is unset or the PIN does not match. Never log the PIN value.
+  if (!isPinValid(pin)) {
+    return NextResponse.redirect(home);
+  }
   if (!proposalId || !Number.isFinite(proposalId)) {
     return NextResponse.redirect(home);
   }
