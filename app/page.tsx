@@ -108,6 +108,62 @@ export default async function PortfolioHome() {
   const open = trades.filter((t) => t.status === "open");
   const closed = trades.filter((t) => t.status !== "open");
 
+  // Human-in-the-loop: today's pending proposal, approval mode,
+  // and recent proposal history. Tables are created by the trade
+  // routes; if they do not exist yet, these fall back to empty.
+  let approvalOn = true;
+  try {
+    await sql`CREATE TABLE IF NOT EXISTS trade_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+    const setting = await sql`SELECT value FROM trade_settings WHERE key = 'human_approval' LIMIT 1`;
+    if (setting.length > 0) approvalOn = setting[0].value !== "off";
+  } catch {
+    approvalOn = true;
+  }
+  const pendingProposals = await safe(
+    () =>
+      sql`
+        SELECT id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date, status, created_at
+        FROM trade_proposals
+        WHERE status = 'pending' AND DATE(created_at) = CURRENT_DATE
+        ORDER BY created_at DESC LIMIT 1
+      `,
+    [] as AnyRow[],
+  );
+  const proposal = pendingProposals[0] ?? null;
+  const recentProposals = await safe(
+    () =>
+      sql`
+        SELECT id, ticker, leaderboard_rank, score, price_at_proposal, status, created_at, decided_at
+        FROM trade_proposals ORDER BY created_at DESC LIMIT 5
+      `,
+    [] as AnyRow[],
+  );
+  // Sector for the concentration flag (same public mapping as the
+  // scanner's sector leaders, compacted to the large names).
+  const SECTOR: Record<string, string> = {
+    AAPL: "Information Technology", MSFT: "Information Technology", NVDA: "Information Technology",
+    AVGO: "Information Technology", AMD: "Information Technology", INTC: "Information Technology",
+    CSCO: "Information Technology", ORCL: "Information Technology", CRM: "Information Technology",
+    JPM: "Financials", V: "Financials", MA: "Financials", BAC: "Financials", WFC: "Financials", GS: "Financials",
+    GOOGL: "Communication Services", META: "Communication Services", NFLX: "Communication Services", DIS: "Communication Services",
+    LLY: "Health Care", JNJ: "Health Care", ABBV: "Health Care", UNH: "Health Care",
+    AMZN: "Consumer Discretionary", TSLA: "Consumer Discretionary", HD: "Consumer Discretionary",
+    GE: "Industrials", CAT: "Industrials", BA: "Industrials", HON: "Industrials",
+    WMT: "Consumer Staples", COST: "Consumer Staples", PG: "Consumer Staples", KO: "Consumer Staples",
+    XOM: "Energy", CVX: "Energy", NEE: "Utilities", PLD: "Real Estate", LIN: "Materials",
+  };
+  const proposalSector = proposal ? SECTOR[proposal.ticker] : undefined;
+  const sameSectorOpen = proposalSector
+    ? open.filter((t) => SECTOR[t.ticker] === proposalSector).map((t) => t.ticker)
+    : [];
+  const proposalDaysToEvent = (() => {
+    if (!proposal || !proposal.event_date) return null;
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const ev = new Date(proposal.event_date);
+    return Math.round((ev.getTime() - today.getTime()) / 86400000);
+  })();
+
   const openRows = open.map((t) => {
     const entry = num(t.entry_price);
     const livePos = liveByTicker.get(t.ticker);
@@ -241,6 +297,66 @@ export default async function PortfolioHome() {
         {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) today / since purchase`}
       </div>
       <div className="meta">Invested ${invested.toFixed(2)} across {open.length} open position{open.length === 1 ? "" : "s"} · Closed P/L ${closedPlUsd >= 0 ? "+" : "−"}$${Math.abs(closedPlUsd).toFixed(2)}</div>
+
+      <section className="card">
+        <h2>Trade approval — human in the loop</h2>
+        <p className="meta">
+          Approval mode is <strong>{approvalOn ? "ON" : "OFF"}</strong>. {approvalOn
+            ? "The daily run proposes a trade and buys nothing until you approve it here."
+            : "The daily run buys directly, as before."}{" "}
+          Sells are always automatic at +5% / −3% — waiting to approve a stop could let a gain reverse or a loss deepen.
+        </p>
+        <form method="post" action="/api/trade/settings" style={{ marginTop: 10 }}>
+          <input type="hidden" name="value" value={approvalOn ? "off" : "on"} />
+          <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #0b1f3a", background: "#0b1f3a", color: "#fff", fontSize: 14, cursor: "pointer" }}>
+            Turn approval {approvalOn ? "OFF" : "ON"}
+          </button>
+        </form>
+        {proposal ? (
+          <div style={{ marginTop: 16, border: "2px solid #0b1f3a", borderRadius: 14, padding: 14 }}>
+            <div style={{ fontSize: 20, fontWeight: 800 }}>{proposal.ticker} — proposed buy, $100</div>
+            <div className="meta">
+              Rank {proposal.leaderboard_rank ?? "—"} · Score {proposal.score ?? "—"} · Price at proposal ${proposal.price_at_proposal ?? "—"}
+              {proposal.catalyst_type ? ` · ${proposal.catalyst_type}` : ""}
+              {proposal.event_date ? ` · Event ${fmtDate(proposal.event_date)}` : ""}
+            </div>
+            <div className="meta">{proposal.catalyst ?? ""}</div>
+            <div className="meta">
+              {proposalDaysToEvent !== null && proposalDaysToEvent <= 1
+                ? "⚠️ Earnings/event in " + proposalDaysToEvent + " day(s) — high event risk: the move can gap straight past the stop. "
+                : ""}
+              {proposalDaysToEvent !== null && proposalDaysToEvent > 1 ? `Event in ${proposalDaysToEvent} days. ` : ""}
+              {sameSectorOpen.length > 0
+                ? `⚠️ Same sector (${proposalSector}) as open position${sameSectorOpen.length === 1 ? "" : "s"}: ${sameSectorOpen.join(", ")} — this would concentrate that sector. `
+                : ""}
+              {Number(proposal.score) < 60 ? "Score is watch-range (< 60), not strong. " : ""}
+              Approval executes at the current market price for $100 notional — the proposal price is a reference, not a limit. Guards are re-checked at approval (score ≥ 50, 1-day fall &gt; −5%); if it now fails, no order is placed.
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+              <form method="post" action="/api/trade/approve">
+                <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "none", background: "#137333", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                  ✓ Approve buy
+                </button>
+              </form>
+              <form method="post" action="/api/trade/reject">
+                <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "1px solid #a50e0e", background: "#fff", color: "#a50e0e", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                  ✕ Reject
+                </button>
+              </form>
+            </div>
+            <p className="note">Rejecting is for today only — the ticker stays never-bought and can be proposed again later if it still passes the guards. A proposal expires at the end of the day it was created.</p>
+          </div>
+        ) : (
+          <p className="meta">No trade awaiting approval right now. The next proposal arrives with the next weekday daily run at 06:52 PDT (or with a manual Run now on the daily job).</p>
+        )}
+        {recentProposals.length > 0 && (
+          <div className="meta" style={{ marginTop: 12 }}>
+            Recent proposals: {recentProposals.map((r: any) => `${r.ticker} (${r.status})`).join(" · ")}
+          </div>
+        )}
+      </section>
 
       <section className="card">
         <h2>Portfolio over time</h2>
