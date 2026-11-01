@@ -7,8 +7,10 @@ import { fetchJson, mapLimit, asRecord, num } from "@/lib/feed";
 // fetch daily candles for that ticker over the 7-day window and record:
 // - outcome_pct: close on day 7 (or last available close) vs entry price
 // - max_pct: highest daily high in the window vs entry price
-// - hit_5: max_pct >= 5 (the target was "a 5% rise within 1 week", so
-//   reaching +5% at any point in the window counts, not only closing there)
+// - hit_5: max_pct >= 3 (target relaxed 2026-10-31 to "a 3% rise within 1 week", so
+//   reaching +3% at any point in the window counts, not only closing there.
+//   Column name hit_5 is kept for compatibility with the table created before
+//   the first outcomes landed; it now records the +3% hit.)
 // Runs once a day via cron-job.org, CRON_SECRET-protected, like /api/weekly.
 // First real outcomes land 7 days after the first scans (scans began
 // 2026-10-26, so first outcomes 2026-11-02). Until then the table is
@@ -99,7 +101,7 @@ export async function POST(req: NextRequest) {
       entry,
       outcomePct,
       maxPct,
-      hit: maxPct >= 5,
+      hit: maxPct >= 3,
     };
   });
 
