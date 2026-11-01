@@ -4,8 +4,8 @@ import { closePosition, getPositions, shouldSell } from "@/lib/alpaca";
 
 // TP/SL check: run every 15 minutes alongside /api/scan (cron-job.org).
 // For each open paper trade, look up its Alpaca position's unrealised
-// P/L percent. Sell the whole position if it is >= +5% (take profit)
-// or <= -3% (stop loss). Nothing else closes a position here.
+// P/L percent. Sell the whole position if it is >= +3% (take profit)
+// or <= -2% (stop loss). Nothing else closes a position here. Relaxed 2026-10-31 from +5% / -3%.
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
