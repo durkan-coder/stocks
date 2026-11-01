@@ -17,10 +17,10 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 // the same day could buy twice.
 //
 // Sell rule is unchanged and lives in /api/trade/check: a position is
-// closed at +5% (take profit) or -3% (stop loss), based on Alpaca's
+// closed at +3% (take profit) or -2% (stop loss), based on Alpaca's
 // unrealised P/L, with no waiting for an earnings trigger event.
 // Sells stay AUTOMATIC — waiting for a human to approve a stop-loss
-// could let a +5% gain reverse or a -3% loss deepen. Human approval
+// could let a +3% gain reverse or a -2% loss deepen. Human approval
 // gates BUYS only.
 //
 // Buy guards (added 2026-10-30, Durkan-approved before the Mon Nov 2
