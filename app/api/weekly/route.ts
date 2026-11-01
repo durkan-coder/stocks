@@ -7,43 +7,29 @@ import {
   feedDiagnostics,
   getCompanyNews,
   getEarningsCalendar,
-  getEarningsHistory,
-  getMacroEvents,
-  getMonthlyCandleData,
-  type MonthlyCandleData,
   isoDate,
   mapLimit,
   type NewsItem,
 } from "@/lib/feed";
 import { getUniverse } from "@/lib/universe";
-import { analyzeSentimentBatch, screenSetups, sentimentToScore100 } from "@/lib/openrouter";
 
-// Stage 1, run EVERY DAY via cron-job.org (e.g. pre-market ET).
-// The 1-week horizon stays the same — the event must be within the
-// coming 7 days — but the list is rebuilt daily so a stock that gains
-// a new catalyst is added the same day, not next week, and flagged is_new.
-// Same CRON_SECRET protection as /api/scan.
+// STAGGERED WEEKLY — STAGE 1 (start), run EVERY DAY via cron-job.org
+// (e.g. 06:30 pre-market). This route is deliberately FAST so it
+// finishes well inside cron-job.org's 30-second client timeout:
+// universe + earnings calendar (+ minimum-fill windows) + company
+// news for earnings tickers only, then it WRITES the shortlist
+// immediately with basic reasoning. No sentiment, no monthly
+// candles, no earnings history, no LLM screen here — those run
+// later, one 10-ticker slice at a time, in /api/weekly/step, which
+// updates these rows in place. If every step after start fails,
+// the board still exists for the 15-minute scan and the daily buy,
+// just with thinner reasoning. If start itself is re-run the same
+// day, today's rows + progress are replaced, never duplicated.
 //
-// Real feed (see lib/feed.ts, lib/universe.ts): universe via
-// getUniverse() (live FMP, else static 503), Finnhub
-// earnings calendar for the coming 7 days, and Finnhub company news
-// for earnings tickers only (rate-limit guard). General market news
-// is NOT used as a per-ticker catalyst — a broad headline mapped to
-// a whole sector was copy-paste, not company evidence, so it was removed.
-// LLM sentiment (lib/openrouter.ts) is called HERE, once a day, in
-// batches of <=10 tickers — never in the 15-minute scan. Its result is
-// stored in weekly_shortlist.reasoning so /api/scan can reuse it.
-// Monthly candlestick summaries (lib/feed.ts getMonthlyCandleSummary)
-// are also computed HERE, once a day, reasoning-only — no score change.
-// If every feed call fails, this route writes nothing rather than a
-// fake 50: an empty shortlist is correct, and /api/scan will then
-// record an empty scan.
+// Same CRON_SECRET protection as /api/scan. Catalyst rules are
+// unchanged: earnings + the company's own news only, no invented
+// rows, top-50 cap, minimum 10 via 7-day window extension to 28 days.
 export const dynamic = "force-dynamic";
-// Weekly rebuild does many provider calls (constituents, earnings,
-// company news for up to 40 tickers, LLM sentiment batches), so give
-// it the same headroom as /api/scan. Without this, Vercel's default
-// function limit can cut the run short and cron-job.org reports a
-// timeout even when some rows were already written.
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
@@ -61,23 +47,10 @@ export async function POST(req: NextRequest) {
   const to = isoDate(addDays(now, 7));
   const newsFrom = isoDate(addDays(now, -3));
 
-  // Universe fix (2026-10-30, shortlist stuck at 2): weekly used
-  // getSp500Constituents() directly, which falls back to a ~30-name
-  // list when FMP is 401 — so only earnings among those 30 names
-  // could ever make the shortlist, no matter the top-50 cap. Use
-  // getUniverse() instead: live FMP when it works, else the static
-  // 503-name S&P 500 list (public tickers with sectors), so a
-  // 7-day earnings window across the full index naturally yields
-  // well over 10 candidates in earnings season. Catalyst rules are
-  // unchanged: earnings + the company's own news only, no invented
-  // rows, and the top-50 cap still applies.
   const constituentsResult = await getUniverse();
   const constituents = constituentsResult.list;
   const earnings = await getEarningsCalendar(from, to);
 
-  // Company news only for earnings tickers (bounded, fail-soft).
-  // Earnings tickers not in the constituent list are ignored later,
-  // so only fetch news for the intersection, capped at 40.
   const constituentTickers = new Set(constituents.map((c) => c.ticker));
   const earningsTickers = [...new Set(earnings.map((e) => e.symbol))]
     .filter((t) => constituentTickers.has(t))
@@ -98,19 +71,9 @@ export async function POST(req: NextRequest) {
   });
   let top50 = selectTop50(events);
 
-  // Minimum-fill (2026-10-30, Durkan: shortlist AND leaderboard must
-  // have at least 10): the 7-day window across the full index is
-  // usually plenty in earnings season, but in a quiet week it can
-  // still land below 10 — and the leaderboard can never exceed the
-  // shortlist, since the 15-minute scan only covers shortlist
-  // tickers. So if top50 < 10, extend the earnings window in 7-day
-  // steps (up to 28 days total) and add those verified earnings
-  // events until 10 is reached. Every added ticker still has a
-  // real, dated earnings catalyst — its event date is stored and
-  // shown, so a 14/21/28-day earnings ticker is visibly further
-  // out than a 7-day one. No ticker is ever invented to fill a
-  // slot, and the top-50 cap still applies. One Finnhub calendar
-  // call per extra window; no extra news/monthly calls.
+  // Minimum-fill: if top50 < 10, extend the earnings window in
+  // 7-day steps (up to 28 days total) until 10 verified earnings
+  // events are present. No ticker is ever invented to fill a slot.
   let fillWindowStart = to;
   let fillWindowEnd = to;
   while (top50.length < 10 && fillWindowEnd < isoDate(addDays(now, 28))) {
@@ -128,39 +91,11 @@ export async function POST(req: NextRequest) {
     top50 = selectTop50(events);
   }
 
-  // LLM sentiment, once a day, batched (<=10 per call). Headlines are
-  // the company's own news where available, else the event detail.
-  // On failure / no key, analyzeSentimentBatch returns an empty map
-  // and the reasoning below simply has no LLM suffix — never a fake.
-  const sentimentByTicker = new Map<string, { score100: number; label: string; reason: string }>();
-  if (top50.length > 0) {
-    for (let i = 0; i < top50.length; i += 10) {
-      const batch = top50.slice(i, i + 10).map((e) => ({
-        ticker: e.ticker,
-        headlines: (companyNewsByTicker.get(e.ticker) ?? [])
-          .slice(0, 3)
-          .map((n) => n.headline),
-      }));
-      const results = await analyzeSentimentBatch(batch);
-      for (const r of results.values()) {
-        sentimentByTicker.set(r.ticker, {
-          score100: sentimentToScore100(r.score),
-          label: r.label,
-          reason: r.reason,
-        });
-      }
-    }
-  }
-
-  // Week starting Monday (UTC date) — kept for grouping; the rebuild
-  // itself is daily, keyed by created_at in the queries.
   const monday = new Date(now);
   const day = now.getUTCDay(); // 0 = Sunday
   monday.setUTCDate(now.getUTCDate() - ((day + 6) % 7));
   const weekStart = monday.toISOString().slice(0, 10);
 
-  // New-ticker detection: tickers in today's top 50 that were NOT in
-  // any earlier shortlist. These are what the user wants to spot.
   let previous = new Set<string>();
   try {
     const prevRows = await sql`
@@ -173,135 +108,14 @@ export async function POST(req: NextRequest) {
   }
   const newTickers = top50.filter((e) => !previous.has(e.ticker)).map((e) => e.ticker);
 
-  // Monthly candlestick summary, once a day, reasoning-only.
-  // Daily candles for the shortlist tickers only (never per 15-min
-  // scan tick), concurrency 4 (lowered from 8: the weekly run makes
-  // ~100+ Finnhub calls against a 60/min free limit, and the
-  // monthly batch was the one returning empty on Oct 28), fail-soft
-  // per ticker, with a TwelveData fallback inside
-  // getMonthlyCandleData. A ticker with no data from either provider
-  // simply gets no monthly line. This does NOT change any score —
-  // technical/volume/catalyst/sentiment are computed exactly as
-  // before in /api/scan.
-  const monthlyByTicker = new Map<string, MonthlyCandleData>();
-  if (top50.length > 0) {
-    const monthlyPairs = await mapLimit(top50, 4, async (e) => ({
-      ticker: e.ticker,
-      data: await getMonthlyCandleData(e.ticker),
-    }));
-    for (const pair of monthlyPairs) {
-      if (pair.data) monthlyByTicker.set(pair.ticker, pair.data);
-    }
-  }
-
-  // Sector relative strength: month % of the 11 sector ETFs, fetched
-  // once a day (11 candle calls). A ticker's sector-relative move is
-  // its month % minus its sector ETF's month % — a real sector score
-  // input for /api/scan, replacing the old keyword bump.
-  const sectorEtfBySector: Record<string, string> = {
-    "Information Technology": "XLK", Technology: "XLK",
-    Financials: "XLF", "Financial Services": "XLF",
-    "Communication Services": "XLC",
-    "Health Care": "XLV", Healthcare: "XLV",
-    "Consumer Discretionary": "XLY",
-    Industrials: "XLI",
-    "Consumer Staples": "XLP",
-    Energy: "XLE",
-    Utilities: "XLU",
-    "Real Estate": "XLRE",
-    Materials: "XLB",
-  };
-  const sectorMonthByEtf = new Map<string, number>();
-  try {
-    // Dedupe: XLK/XLF/XLV each appear twice in the sector map, so
-    // the old Object.values list made 14 ETF calls for 11 ETFs.
-    const etfPairs = await mapLimit([...new Set(Object.values(sectorEtfBySector))], 4, async (etf) => ({
-      etf,
-      data: await getMonthlyCandleData(etf),
-    }));
-    for (const pair of etfPairs) {
-      if (pair.data) sectorMonthByEtf.set(pair.etf, pair.data.monthPct);
-    }
-  } catch {
-    // ETF failure -> sector-relative is null, scan falls back to 50.
-  }
-  const constituentSectorByTicker = new Map(constituents.map((c) => [c.ticker, c.sector ?? ""]));
-  const sectorRelByTicker = new Map<string, number>();
-  for (const e of top50) {
-    const m = monthlyByTicker.get(e.ticker);
-    const sector = constituentSectorByTicker.get(e.ticker) ?? "";
-    const etf = sectorEtfBySector[sector];
-    const etfMonth = etf ? sectorMonthByEtf.get(etf) : undefined;
-    if (m && etfMonth !== undefined) sectorRelByTicker.set(e.ticker, m.monthPct - etfMonth);
-  }
-
-  // Earnings surprise history for earnings tickers in the shortlist.
-  // Small score modifier only: beat >=3/4 -> +3, beat <=1/4 -> -3,
-  // otherwise 0. Reasoning always carries the history line.
-  const earningsHistoryByTicker = new Map<string, { beats: number; total: number; avgSurprisePct: number | null; summary: string }>();
-  try {
-    const earningsTop = top50.filter((e) => e.type === "earnings");
-    const histPairs = await mapLimit(earningsTop, 5, async (e) => ({
-      ticker: e.ticker,
-      hist: await getEarningsHistory(e.ticker),
-    }));
-    for (const pair of histPairs) {
-      if (pair.hist) earningsHistoryByTicker.set(pair.ticker, pair.hist);
-    }
-  } catch {
-    // History failure -> no modifier, no history line.
-  }
-  for (const e of top50) {
-    const h = earningsHistoryByTicker.get(e.ticker);
-    if (!h || h.total < 3) continue;
-    if (h.beats >= 3) e.score = Math.min(100, e.score + 3);
-    else if (h.beats <= 1) e.score = Math.max(0, e.score - 3);
-  }
-  top50.sort((a, b) => b.score - a.score);
-
-  // Macro events this week (dashboard note only, not a per-ticker catalyst).
-  let macroEvents: Array<{ date: string; event: string }> = [];
-  try {
-    macroEvents = await getMacroEvents(from, to);
-  } catch {
-    macroEvents = [];
-  }
-
-  // LLM screen (our LLM, OpenRouter free model — not Gemini): one call
-  // over the top 15 shortlist candidates, grounded in verified data
-  // only (catalyst, RSI, month trend, volume, historical volatility,
-  // headlines, stored sentiment). Returns up to 5 picks with reasons,
-  // or [] on any failure. Research ranking only: it does NOT change
-  // leaderboard scores, shortlist scores, or paper trades.
-  let llmScreen: Array<{ ticker: string; reason: string }> = [];
-  try {
-    const candidates = top50.slice(0, 15).map((e) => {
-      const m = monthlyByTicker.get(e.ticker);
-      const s = sentimentByTicker.get(e.ticker);
-      return {
-        ticker: e.ticker,
-        catalystType: e.type,
-        eventDate: e.eventDate,
-        eventDetail: e.detail,
-        shortlistScore: e.score,
-        rsi14: m?.rsi14 ?? null,
-        monthPct: m?.monthPct ?? null,
-        volumeRatio: m?.volumeRatio ?? null,
-        avgAbsDailyPct: m?.avgAbsDailyPct ?? null,
-        breakout: m?.breakout ?? false,
-        sentimentLabel: s?.label ?? "neutral",
-        headlines: (companyNewsByTicker.get(e.ticker) ?? []).slice(0, 2).map((n) => n.headline),
-      };
-    });
-    llmScreen = await screenSetups(candidates);
-  } catch {
-    llmScreen = [];
-  }
-
-  // Numeric candle/earnings/sector columns for /api/scan scoring.
-  // Created here if missing, so no manual Neon SQL is needed.
+  // Numeric/enrichment columns for /api/scan scoring. Created here
+  // if missing, so no manual Neon SQL is needed. base_score is the
+  // catalyst score at start time; the enrich step recomputes
+  // score = base_score + earnings-history modifier, so a retried
+  // enrich slice can never apply the modifier twice.
   try {
     await sql`ALTER TABLE weekly_shortlist
+      ADD COLUMN IF NOT EXISTS base_score NUMERIC,
       ADD COLUMN IF NOT EXISTS rsi14 NUMERIC,
       ADD COLUMN IF NOT EXISTS month_pct NUMERIC,
       ADD COLUMN IF NOT EXISTS volume_ratio NUMERIC,
@@ -315,108 +129,73 @@ export async function POST(req: NextRequest) {
       ADD COLUMN IF NOT EXISTS earnings_total INTEGER,
       ADD COLUMN IF NOT EXISTS avg_surprise_pct NUMERIC`;
   } catch {
-    // If ALTER fails, inserts below still run without the new columns
-    // only if the columns already exist; otherwise this run's inserts
-    // will fail and the next run (after init-db) will succeed.
+    // Inserts below still run if the columns already exist.
+  }
+
+  // Idempotent for the day: a re-run replaces today's rows and
+  // resets progress, instead of duplicating the shortlist.
+  try {
+    await sql`DELETE FROM weekly_shortlist WHERE DATE(created_at) = CURRENT_DATE`;
+  } catch {
+    // First-ever run: table may not exist yet; inserts below fail
+    // loudly in that case, which is correct — it must not silently
+    // report success with no board.
   }
 
   for (const e of top50) {
-    const llm = sentimentByTicker.get(e.ticker);
-    const m = monthlyByTicker.get(e.ticker);
-    const hist = earningsHistoryByTicker.get(e.ticker);
-    const sectorRel = sectorRelByTicker.get(e.ticker);
-    // event_detail stays the raw catalyst; reasoning carries it plus
-    // the monthly candle summary, earnings history, sector-relative
-    // move, and the stored LLM sentiment, which /api/scan parses
-    // back out (LLM regex) and displays as-is.
-    const reasoning = [
-      e.detail,
-      m?.summary ?? null,
-      hist?.summary ?? null,
-      sectorRel !== undefined ? `vs sector: ${sectorRel >= 0 ? "+" : ""}${sectorRel.toFixed(1)}% this month.` : null,
-      llm
-        ? `Sentiment (LLM): ${llm.label}, ${((llm.score100 - 50) / 50).toFixed(2)} — ${llm.reason}`
-        : null,
-    ]
-      .filter((p): p is string => p !== null)
-      .join(" ");
     await sql`
       INSERT INTO weekly_shortlist
         (week_start, ticker, company, catalyst_type, event_date,
-         event_detail, reasoning, score, sources, is_new,
+         event_detail, reasoning, score, base_score, sources, is_new,
          rsi14, month_pct, volume_ratio, avg_abs_daily_pct, change_5d_pct,
          sector_rel_pct, expected_move_pct, expected_move_expiry, expected_move_iv,
          earnings_beats, earnings_total, avg_surprise_pct)
       VALUES (
         ${weekStart}, ${e.ticker}, ${e.company ?? null}, ${e.type},
-        ${e.eventDate ?? null}, ${e.detail}, ${reasoning}, ${e.score},
+        ${e.eventDate ?? null}, ${e.detail}, ${e.detail}, ${e.score}, ${e.score},
         ${e.sources ?? null}, ${!previous.has(e.ticker)},
-        ${m?.rsi14 ?? null}, ${m?.monthPct ?? null}, ${m?.volumeRatio ?? null},
-        ${m?.avgAbsDailyPct ?? null}, ${m?.change5dPct ?? null},
-        ${sectorRel ?? null}, ${null}, ${null},
-        ${null}, ${hist?.beats ?? null}, ${hist?.total ?? null},
-        ${hist?.avgSurprisePct ?? null}
+        ${null}, ${null}, ${null},
+        ${null}, ${null},
+        ${null}, ${null}, ${null},
+        ${null}, ${null}, ${null},
+        ${null}
       )
     `;
   }
 
-  // Macro events for the dashboard (replacing today's rows).
+  // Progress for /api/weekly/step. Stages, in order: enrich slices
+  // (10 tickers each), sentiment slices, then finalize (macro +
+  // LLM screen). A step that crashes leaves the pointer untouched,
+  // so the next step call retries the same slice.
   try {
-    await sql`CREATE TABLE IF NOT EXISTS macro_events (
-      id SERIAL PRIMARY KEY,
-      event_date DATE NOT NULL,
-      event TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    await sql`CREATE TABLE IF NOT EXISTS weekly_progress (
+      run_date DATE PRIMARY KEY,
+      stage TEXT NOT NULL,
+      slice INTEGER NOT NULL,
+      finished BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`;
-    await sql`DELETE FROM macro_events WHERE DATE(created_at) = CURRENT_DATE`;
-    for (const ev of macroEvents) {
-      await sql`INSERT INTO macro_events (event_date, event) VALUES (${ev.date}, ${ev.event})`;
+    await sql`DELETE FROM weekly_progress WHERE run_date = CURRENT_DATE`;
+    if (top50.length > 0) {
+      await sql`INSERT INTO weekly_progress (run_date, stage, slice, finished)
+        VALUES (CURRENT_DATE, 'enrich', 0, FALSE)`;
     }
   } catch {
-    // Macro storage failure must not fail the weekly rebuild.
+    // Progress failure must not hide a successful shortlist write,
+    // but the step route will then report idle — surfaced in the
+    // response below via progressOk.
   }
-
-  // Store today's LLM screen, replacing any earlier screen from the
-  // same calendar day (weekly rebuilds are daily, one screen per day).
-  // Table is created here if missing, so no manual Neon SQL is needed;
-  // /api/init-db creates the same table for completeness.
+  let progressOk = false;
   try {
-    await sql`CREATE TABLE IF NOT EXISTS llm_screen (
-      id SERIAL PRIMARY KEY,
-      screen_date DATE NOT NULL,
-      rank INTEGER NOT NULL,
-      ticker TEXT NOT NULL,
-      reason TEXT NOT NULL,
-      catalyst_type TEXT,
-      event_date DATE,
-      rsi14 NUMERIC,
-      month_pct NUMERIC,
-      volume_ratio NUMERIC,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`;
-    await sql`DELETE FROM llm_screen WHERE DATE(created_at) = CURRENT_DATE`;
-    for (let i = 0; i < llmScreen.length; i++) {
-      const pick = llmScreen[i];
-      const e = top50.find((x) => x.ticker === pick.ticker);
-      const m = monthlyByTicker.get(pick.ticker);
-      await sql`
-        INSERT INTO llm_screen
-          (screen_date, rank, ticker, reason, catalyst_type, event_date, rsi14, month_pct, volume_ratio)
-        VALUES (
-          ${now.toISOString().slice(0, 10)}, ${i + 1}, ${pick.ticker}, ${pick.reason},
-          ${e?.type ?? null}, ${e?.eventDate ?? null},
-          ${m?.rsi14 ?? null}, ${m?.monthPct ?? null}, ${m?.volumeRatio ?? null}
-        )
-      `;
-    }
+    const rows = await sql`SELECT 1 FROM weekly_progress WHERE run_date = CURRENT_DATE LIMIT 1`;
+    progressOk = rows.length > 0;
   } catch {
-    // Screen storage failure must not fail the whole weekly rebuild;
-    // the shortlist above is already written. An empty screen is shown.
-    llmScreen = [];
+    progressOk = false;
   }
 
   return NextResponse.json({
     ok: true,
+    stage: "started",
     weekStart,
     runDate: now.toISOString().slice(0, 10),
     tickers: top50.length,
@@ -425,21 +204,13 @@ export async function POST(req: NextRequest) {
     constituents: constituents.length,
     earningsInWindow: earnings.length,
     companyNewsTickers: companyNewsByTicker.size,
-    sentimentTickers: sentimentByTicker.size,
-    monthlyCandleTickers: monthlyByTicker.size,
-    earningsHistoryTickers: earningsHistoryByTicker.size,
-    sectorEtfTickers: sectorMonthByEtf.size,
-    macroEvents: macroEvents.length,
-    llmScreenTickers: llmScreen.length,
-    llmScreen,
-    // Diagnostics only: HTTP status per provider (no keys, no bodies).
-    // 401 = bad key, 402 = paid endpoint, 403 = plan blocked,
-    // 429 = rate limit, timeout-or-network-error = fetch failed.
+    progressOk,
+    nextStep: "/api/weekly/step",
     feedDiagnostics,
     note:
       top50.length === 0
         ? "No verified catalysts in the coming 7 days — no rows written, by design."
-        : undefined,
+        : "Shortlist written. Enrichment runs in /api/weekly/step slices.",
   });
 }
 
