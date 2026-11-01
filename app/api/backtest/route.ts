@@ -11,6 +11,16 @@ import { fetchJson, mapLimit, asRecord, num } from "@/lib/feed";
 //   reaching +3% at any point in the window counts, not only closing there.
 //   Column name hit_5 is kept for compatibility with the table created before
 //   the first outcomes landed; it now records the +3% hit.)
+//
+// SPY BASELINE (added 2026-11-01, adapted from other scanners' control
+// habit): the same window is also evaluated for SPY itself, in one
+// extra Finnhub call, and stored in backtest_baseline (one row per
+// scan_date). A hit rate only counts as an edge if the picks beat
+// SPY over the same window — if SPY itself rose 3% that week, a
+// pick hitting 3% proves nothing. A random-ticker control was NOT
+// added: it would double Finnhub calls and blow the free limit.
+// Mean pick outcome vs SPY outcome is the control that matters
+// for a beat-SPY goal, and it costs exactly one extra call.
 // Runs once a day via cron-job.org, CRON_SECRET-protected, like /api/weekly.
 // First real outcomes land 7 days after the first scans (scans began
 // 2026-10-26, so first outcomes 2026-11-02). Until then the table is
@@ -125,6 +135,68 @@ export async function POST(req: NextRequest) {
   }
   const hits = results.filter((o) => o && o.hit).length;
   const total = results.filter((o) => o !== null).length;
+  const meanOutcome = total > 0
+    ? results.filter((o) => o !== null).reduce((s, o) => s + (o as any).outcomePct, 0) / total
+    : null;
+
+  // SPY baseline for the same window: first close to last close,
+  // and max high vs first close. One extra Finnhub call, no new feed.
+  let spyBaseline: any = null;
+  try {
+    const spyData = await fetchJson(
+      `https://finnhub.io/api/v1/stock/candle?symbol=SPY&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
+      6000,
+    );
+    const sr = asRecord(spyData);
+    if (sr && sr.s === "ok" && Array.isArray(sr.c) && sr.c.length > 0) {
+      const sCloses = (sr.c as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined);
+      const sHighs = Array.isArray(sr.h)
+        ? (sr.h as unknown[]).map((v) => num(v)).filter((v): v is number => v !== undefined)
+        : [];
+      if (sCloses.length > 0) {
+        const spyOutcome = ((sCloses[sCloses.length - 1] - sCloses[0]) / sCloses[0]) * 100;
+        const spyMax = sHighs.length > 0 ? ((Math.max(...sHighs) - sCloses[0]) / sCloses[0]) * 100 : spyOutcome;
+        spyBaseline = {
+          scanDate: targetDate,
+          spyOutcomePct: spyOutcome,
+          spyMaxPct: spyMax,
+          spyHit3: spyMax >= 3,
+          picksEvaluated: total,
+          picksHit3: hits,
+          picksMeanOutcomePct: meanOutcome,
+          edgeVsSpyPct: meanOutcome !== null ? meanOutcome - spyOutcome : null,
+        };
+        await sql`CREATE TABLE IF NOT EXISTS backtest_baseline (
+          scan_date DATE PRIMARY KEY,
+          spy_outcome_pct NUMERIC,
+          spy_max_pct NUMERIC,
+          spy_hit_3 BOOLEAN NOT NULL DEFAULT FALSE,
+          picks_evaluated INTEGER,
+          picks_hit_3 INTEGER,
+          picks_mean_outcome_pct NUMERIC,
+          edge_vs_spy_pct NUMERIC,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`;
+        await sql`
+          INSERT INTO backtest_baseline
+            (scan_date, spy_outcome_pct, spy_max_pct, spy_hit_3, picks_evaluated, picks_hit_3, picks_mean_outcome_pct, edge_vs_spy_pct)
+          VALUES (${targetDate}, ${spyOutcome}, ${spyMax}, ${spyMax >= 3}, ${total}, ${hits}, ${meanOutcome}, ${spyBaseline.edgeVsSpyPct})
+          ON CONFLICT (scan_date) DO UPDATE SET
+            spy_outcome_pct = EXCLUDED.spy_outcome_pct,
+            spy_max_pct = EXCLUDED.spy_max_pct,
+            spy_hit_3 = EXCLUDED.spy_hit_3,
+            picks_evaluated = EXCLUDED.picks_evaluated,
+            picks_hit_3 = EXCLUDED.picks_hit_3,
+            picks_mean_outcome_pct = EXCLUDED.picks_mean_outcome_pct,
+            edge_vs_spy_pct = EXCLUDED.edge_vs_spy_pct
+        `;
+      }
+    }
+  } catch {
+    // Baseline failure must not lose the pick outcomes already written.
+    spyBaseline = null;
+  }
+
   return NextResponse.json({
     ok: true,
     targetDate,
@@ -133,6 +205,8 @@ export async function POST(req: NextRequest) {
     written,
     hits,
     hitRatePct: total > 0 ? Math.round((hits / total) * 1000) / 10 : null,
+    meanOutcomePct: meanOutcome,
+    spyBaseline,
   });
 }
 
