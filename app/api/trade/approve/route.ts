@@ -18,7 +18,7 @@ import { isPinValid } from "@/lib/approvalPin";
 //     price for $100 notional (the proposal price is a reference,
 //     not a limit — a market order cannot guarantee it).
 // Sells are NOT gated here: /api/trade/check still closes at
-// +5% / -3% automatically.
+// +3% / -2% automatically.
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
