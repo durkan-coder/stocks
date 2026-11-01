@@ -94,6 +94,31 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
+  // SPY baseline (one row per scan_date, written by /api/backtest):
+  // picks only count as an edge if they beat SPY over the same window.
+  const baselineRows = await safe(
+    () =>
+      sql`
+        SELECT scan_date, spy_outcome_pct, spy_max_pct, spy_hit_3, picks_evaluated, picks_hit_3, picks_mean_outcome_pct, edge_vs_spy_pct
+        FROM backtest_baseline ORDER BY scan_date DESC LIMIT 20
+      `,
+    [] as AnyRow[],
+  );
+  // Conviction bands: strong >= 75, notable 60-74, watch 50-59.
+  // Eliminated only at >= 20 outcomes AND hit rate < 40% (break-even
+  // for +3% / -2%); below 20 outcomes the band stays active.
+  const bandRows = await safe(
+    () =>
+      sql`
+        SELECT
+          CASE WHEN score >= 75 THEN 'strong' WHEN score >= 60 THEN 'notable' ELSE 'watch' END AS band,
+          COUNT(*)::int AS n,
+          COALESCE(SUM(CASE WHEN hit_5 THEN 1 ELSE 0 END), 0)::int AS hits,
+          COALESCE(AVG(outcome_pct), 0) AS avg_outcome
+        FROM pick_outcomes WHERE score IS NOT NULL GROUP BY 1 ORDER BY 1
+      `,
+    [] as AnyRow[],
+  );
   const macro = await safe(
     () =>
       sql`
@@ -136,7 +161,7 @@ async function getData() {
     () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, macro, attempts, stagger: stagger[0] ?? null, staggerState };
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, baselineRows, bandRows, macro, attempts, stagger: stagger[0] ?? null, staggerState };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -209,7 +234,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, macro, attempts, stagger, staggerState } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, baselineRows, bandRows, macro, attempts, stagger, staggerState } = await getData();
   const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
@@ -465,6 +490,48 @@ export default async function Page() {
               ))}
             </div>
           </>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>SPY baseline — did picks actually beat SPY?</h2>
+        <p className="section-note">One row per scan_date, written by /api/backtest from SPY candles over the same 7-day window. A pick hitting +3% in a week SPY also rose 3% proves nothing — edge is mean pick outcome minus SPY outcome. Empty until the first outcomes land Nov 2.</p>
+        {baselineRows.length === 0 ? (
+          <p>No baseline rows yet.</p>
+        ) : (
+          <div className="cards">
+            {baselineRows.map((b: any) => (
+              <div key={String(b.scan_date)} className="row-card">
+                <div className="ticker" style={{ fontSize: 15 }}>Week of {fmt(b.scan_date)}</div>
+                <div className="meta">
+                  Picks {b.picks_hit_3}/{b.picks_evaluated} hit +3% · Mean pick {Number(b.picks_mean_outcome_pct).toFixed(1)}% ·
+                  SPY {Number(b.spy_outcome_pct).toFixed(1)}% (max {Number(b.spy_max_pct).toFixed(1)}%, SPY hit +3%: {b.spy_hit_3 ? "yes" : "no"}) ·
+                  Edge vs SPY {Number(b.edge_vs_spy_pct).toFixed(1)}%
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Conviction bands — with elimination</h2>
+        <p className="section-note">Strong ≥ 75, Notable 60–74, Watch 50–59. A band is ELIMINATED from future proposals only at ≥ 20 outcomes AND hit rate below 40% (the break-even for +3% / −2%). Below 20 outcomes the band stays active — small samples must not kill a band. Elimination is a veto only; scores are never changed.</p>
+        {bandRows.length === 0 ? (
+          <p>No outcomes yet — bands appear with the first outcomes.</p>
+        ) : (
+          <div className="cards">
+            {bandRows.map((b: any) => {
+              const hitRate = b.n > 0 ? (b.hits / b.n) * 100 : 0;
+              const eliminated = b.n >= 20 && hitRate < 40;
+              return (
+                <div key={String(b.band)} className="row-card">
+                  <div className="ticker" style={{ fontSize: 15 }}>{String(b.band)} {eliminated ? "— ELIMINATED" : ""}</div>
+                  <div className="meta">{hitRate.toFixed(1)}% hit rate · {b.hits}/{b.n} picks · Avg outcome {Number(b.avg_outcome).toFixed(1)}% · {b.n >= 20 ? "enough data to eliminate" : "too few outcomes to eliminate"}</div>
+                </div>
+              );
+            })}
+          </div>
         )}
       </section>
 
