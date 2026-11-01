@@ -10,7 +10,7 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 // Behaviour on purpose:
 // - Skips a ticker already open this week (no duplicate $100 buys).
 // - Does NOT automatically close positions at week end. A position is
-//   closed only by /api/trade/check at +5% / -3% (see that route).
+//   closed only by /api/trade/check at +3% / -2% (see that route).
 //   If Durkan wants a week-end close as well, that is a separate rule
 //   to add, not a silent default.
 // - Each buy is wrapped in try/catch: previously a single rejected
