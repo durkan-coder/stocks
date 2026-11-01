@@ -42,8 +42,8 @@ function fmtDate(v: any): string {
 
 function plColor(pct: number | null): string {
   if (pct === null) return "#5f6368";
-  if (pct > 0.05) return "#137333";
-  if (pct < -0.05) return "#a50e0e";
+  if (pct > 0.03) return "#137333";
+  if (pct < -0.02) return "#a50e0e";
   return "#5f6368";
 }
 
@@ -192,8 +192,8 @@ export default async function PortfolioHome() {
     const shares = entry !== null && entry > 0 ? notional / entry : null;
     const plUsd = plPct === null ? null : (plPct / 100) * notional;
     const currentValue = current !== null && shares !== null ? shares * current : null;
-    const tp = entry === null ? null : entry * 1.05;
-    const sl = entry === null ? null : entry * 0.97;
+    const tp = entry === null ? null : entry * 1.03;
+    const sl = entry === null ? null : entry * 0.98;
     // Sparkline: this ticker's scan prices since purchase.
     const openedMs = new Date(t.opened_at).getTime();
     const spark = historyRows
@@ -308,7 +308,7 @@ export default async function PortfolioHome() {
           Approval mode is <strong>{approvalOn ? "ON" : "OFF"}</strong>. {approvalOn
             ? "The daily run proposes a trade and buys nothing until you approve it here."
             : "The daily run buys directly, as before."}{" "}
-          Sells are always automatic at +5% / −3% — waiting to approve a stop could let a gain reverse or a loss deepen.
+          Sells are always automatic at +3% / −2% — waiting to approve a stop could let a gain reverse or a loss deepen.
         </p>
         {!pinConfigured && (
           <p className="meta" style={{ color: "#a50e0e", fontWeight: 700 }}>
@@ -431,7 +431,7 @@ export default async function PortfolioHome() {
             </table>
           </div>
         )}
-        <p className="note">Sell rule: +5% take profit, −3% stop loss, checked every 15 minutes. A gap at the open can close beyond −3% — the stop limits, but does not guarantee, the loss.</p>
+        <p className="note">Sell rule: +3% take profit, −2% stop loss, checked every 15 minutes. A gap at the open can close beyond −2% — the stop limits, but does not guarantee, the loss.</p>
       </section>
 
       <section className="card">
