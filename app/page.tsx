@@ -160,6 +160,24 @@ export default async function PortfolioHome() {
   const sameSectorOpen = proposalSector
     ? open.filter((t) => SECTOR[t.ticker] === proposalSector).map((t) => t.ticker)
     : [];
+  // Regime breadth (same definition as the daily gate): share of
+  // fresh price_cache tickers up on the day. Weak = < 40%, which
+  // raises the daily score floor from 50 to 75 for that run only.
+  const regimeRows = await safe(
+    () =>
+      sql`
+        SELECT COUNT(*)::int AS n,
+          COALESCE(SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END), 0)::int AS up,
+          COALESCE(AVG(change_pct), 0) AS avg_change,
+          MAX(updated_at) AS at
+        FROM price_cache
+        WHERE updated_at > NOW() - INTERVAL '2 hours' AND change_pct IS NOT NULL
+      `,
+    [] as AnyRow[],
+  );
+  const regimeN = Number(regimeRows[0]?.n ?? 0);
+  const regimeBreadth = regimeN >= 100 ? Math.round(((Number(regimeRows[0]?.up ?? 0) / regimeN) * 100) * 10) / 10 : null;
+  const regimeStatus = regimeBreadth === null ? "data unavailable — gate inactive" : regimeBreadth < 40 ? "weak — daily score floor raised to 75" : "normal — score floor 50";
   const proposalDaysToEvent = (() => {
     if (!proposal || !proposal.event_date) return null;
     const today = new Date();
@@ -301,6 +319,15 @@ export default async function PortfolioHome() {
         {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) today / since purchase`}
       </div>
       <div className="meta">Invested ${invested.toFixed(2)} across {open.length} open position{open.length === 1 ? "" : "s"} · Closed P/L ${closedPlUsd >= 0 ? "+" : "−"}$${Math.abs(closedPlUsd).toFixed(2)}</div>
+
+      <section className="card">
+        <h2>Market regime</h2>
+        <p className="meta">
+          Breadth: {regimeBreadth === null ? "—" : `${regimeBreadth}% up`} across {regimeN} fresh staggered tickers · Status: <strong>{regimeStatus}</strong>
+          {regimeBreadth !== null ? ` · Avg change ${Number(regimeRows[0]?.avg_change ?? 0).toFixed(2)}%` : ""}
+        </p>
+        <p className="note">Regime gate: breadth below 40% raises the daily score floor from 50 to 75 for that run only. If breadth data is stale or too thin, the gate is inactive rather than blocking trades on missing data. <a href="/journal">View trade journal →</a></p>
+      </section>
 
       <section className="card">
         <h2>Trade approval — human in the loop</h2>
