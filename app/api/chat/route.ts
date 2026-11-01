@@ -71,7 +71,7 @@ export async function POST(req: NextRequest) {
       }
     }
     if (trades.length) {
-      lines.push("Paper trades (recent, $100 each, paper only; sell at +5% / -3% via /api/trade/check; daily buy is one unique leaderboard stock per day):");
+      lines.push("Paper trades (recent, $100 each, paper only; sell at +3% / -2% via /api/trade/check; daily buy is one unique leaderboard stock per day):");
       for (const t of trades) {
         lines.push(`- ${t.ticker}: rank ${t.leaderboard_rank ?? "?"}, entry ${t.entry_price ?? "?"}, status ${t.status}, exit ${t.exit_price ?? "?"}, pnl ${t.pnl_pct ?? "?"}`);
       }
