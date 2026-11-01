@@ -6,8 +6,8 @@
 // look like Alpaca's paper endpoint.
 
 export const TRADE_NOTIONAL_USD = 100;
-export const TAKE_PROFIT_PCT = 0.05; // sell above +5% from entry
-export const STOP_LOSS_PCT = -0.03; // sell below -3% from entry
+export const TAKE_PROFIT_PCT = 0.03; // sell above +3% from entry (relaxed 2026-10-31, was +5%)
+export const STOP_LOSS_PCT = -0.02; // sell below -2% from entry (relaxed 2026-10-31, was -3%)
 
 function alpacaConfig() {
   const base = process.env.ALPACA_PAPER_URL ?? "https://paper-api.alpaca.markets";
@@ -41,7 +41,7 @@ export interface AlpacaPosition {
   qty: string;
   avg_entry_price: string;
   current_price: string;
-  unrealized_plpc: string; // e.g. "0.052" = +5.2%
+  unrealized_plpc: string; // e.g. "0.032" = +3.2%
   market_value: string;
 }
 
