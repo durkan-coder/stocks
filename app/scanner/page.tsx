@@ -276,7 +276,7 @@ export default async function Page() {
         <p className="section-note">
           Alpaca mode is paper only — the code refuses a non-paper URL, and live trading needs a separate explicit approval. Do not go live until: backtest hit rate is known (first outcomes Nov 2), paper trades have been validated end-to-end, and the take-profit/stop-loss job is re-enabled in cron-job.org (its status cannot be read from here — check it there).
         </p>
-        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +5% / −3%.</div>
+        <div className="meta">Paper trades open: {openTrades.length} · Backtest picks evaluated: {backtestTotal} · Latest scan: {latestScan ? `${fmt(latestScan.scanned_at)} · ${latestScan.market_status}` : "none"} · Daily buy: one unique leaderboard stock per day, $100 each, sell at +3% / −2%.</div>
       </section>
     </>);
   const boardTab = (<>
@@ -392,7 +392,7 @@ export default async function Page() {
   const tradesTab = (<>
       <section className="section">
         <h2>Paper trades — Alpaca paper only</h2>
-        <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +5% or −3%. <a href="/">View portfolio →</a></p>
+        <p className="section-note">Daily /api/trade/daily buys one unique leaderboard stock per day, $100 each. /api/trade/check closes at +3% or −2%. <a href="/">View portfolio →</a></p>
         {trades.length === 0 ? (
           <p>No paper trades yet.</p>
         ) : (
@@ -440,7 +440,7 @@ export default async function Page() {
       <section className="section">
         <h2>Backtest — 7-day outcomes</h2>
         <p className="section-note">
-          For each pick, did it reach +5% within 7 days (daily high vs entry price)? Written daily by /api/backtest for picks from 7 days ago. First outcomes land Nov 2, since scans began Oct 26 — until then this section is honestly empty, not a fabricated hit rate.
+          For each pick, did it reach +3% within 7 days (daily high vs entry price)? Written daily by /api/backtest for picks from 7 days ago. First outcomes land Nov 2, since scans began Oct 26 — until then this section is honestly empty, not a fabricated hit rate.
         </p>
         {backtestTotal === 0 ? (
           <p>No 7-day outcomes yet.</p>
@@ -458,7 +458,7 @@ export default async function Page() {
                       <div className="ticker">{o.ticker}</div>
                       <div className="company">Pick {fmt(o.scan_date)} · Rank {o.rank} · Score {o.score}</div>
                     </div>
-                    <div className="badge" style={{ color: o.hit_5 ? "#137333" : "#5f6368" }}>{o.hit_5 ? "HIT +5%" : "miss"}</div>
+                    <div className="badge" style={{ color: o.hit_5 ? "#137333" : "#5f6368" }}>{o.hit_5 ? "HIT +3%" : "miss"}</div>
                   </div>
                   <div className="meta">Entry {o.entry_price} · 7-day close {Number(o.outcome_pct).toFixed(1)}% · Max rise {Number(o.max_pct).toFixed(1)}%</div>
                 </div>
@@ -469,7 +469,7 @@ export default async function Page() {
       </section>
 
       <section className="section">
-        <h2>Backtest calibration — what actually predicted +5%</h2>
+        <h2>Backtest calibration — what actually predicted +3%</h2>
         <p className="section-note">Hit rate by score bucket and by catalyst type, from recorded 7-day outcomes only. Use this, not intuition, to reweight the score: a bucket that hits rarely should not outrank one that hits often. Empty until the first outcomes land Nov 2.</p>
         {backtestTotal === 0 ? (
           <p>No 7-day outcomes yet — calibration appears with the first outcomes.</p>
@@ -572,7 +572,7 @@ export default async function Page() {
       <p className="back"><a href="/">← Portfolio</a></p>
       <h1>SPY Scanner</h1>
       <p className="subtitle">
-        Potential 5%+ rise within 1 week · Scans every 15 minutes, 24/7 · Daily catalyst shortlist · Paper trades $100 each, sell at +5% / −3%
+        Potential 3%+ rise within 1 week · Scans every 15 minutes, 24/7 · Daily catalyst shortlist · Paper trades $100 each, sell at +3% / −2%
       </p>
       <Tabs
         tabs={[
