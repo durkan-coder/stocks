@@ -156,6 +156,70 @@ export async function POST(req: NextRequest) {
   monday.setUTCDate(now.getUTCDate() - ((day + 6) % 7));
   const weekStart = monday.toISOString().slice(0, 10);
 
+  // REGIME GATE (added 2026-11-01, adapted from other scanners):
+  // breadth = share of fresh staggered price_cache tickers up on the
+  // day. Fresh = updated within 2 hours, at least 100 tickers, or the
+  // gate is inactive (fail open — missing data must not block trades).
+  // Weak regime = breadth < 40%. In a weak regime the score floor
+  // rises from 50 to 75 for this run only; scores are NOT changed.
+  // This uses only Neon data already present — no new feed, no new call.
+  let regime: any = { status: "inactive", breadthPct: null, freshTickers: 0, floor: 50 };
+  try {
+    const b = await sql`
+      SELECT COUNT(*)::int AS n,
+        COALESCE(SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END), 0)::int AS up,
+        COALESCE(AVG(change_pct), 0)::float AS avg_change
+      FROM price_cache
+      WHERE updated_at > NOW() - INTERVAL '2 hours' AND change_pct IS NOT NULL
+    `;
+    const n = Number(b[0]?.n ?? 0);
+    const up = Number(b[0]?.up ?? 0);
+    if (n >= 100) {
+      const breadth = (up / n) * 100;
+      regime = {
+        status: breadth < 40 ? "weak" : "normal",
+        breadthPct: Math.round(breadth * 10) / 10,
+        freshTickers: n,
+        avgChangePct: Math.round(Number(b[0]?.avg_change ?? 0) * 100) / 100,
+        floor: breadth < 40 ? 75 : 50,
+      };
+    }
+  } catch {
+    regime = { status: "inactive", breadthPct: null, freshTickers: 0, floor: 50 };
+  }
+
+  // CONVICTION BANDS WITH ELIMINATION (added 2026-11-01):
+  // Bands: strong >= 75, notable 60-74, watch 50-59. A band is
+  // ELIMINATED only when it has >= 20 backtest outcomes AND a hit
+  // rate < 40% (the break-even for +3% / -2%). Below 20 outcomes the
+  // band stays active — small samples must not kill a band. Elimination
+  // is a veto on proposals only; it never changes scores, and a band
+  // automatically reactivates if later outcomes lift it back to >= 40%.
+  // hit_5 column records the +3% hit (legacy name, see backtest route).
+  const eliminatedBands = new Set<string>();
+  const bandStats: any[] = [];
+  try {
+    const bands = await sql`
+      SELECT
+        CASE WHEN score >= 75 THEN 'strong' WHEN score >= 60 THEN 'notable' ELSE 'watch' END AS band,
+        COUNT(*)::int AS n,
+        COALESCE(SUM(CASE WHEN hit_5 THEN 1 ELSE 0 END), 0)::int AS hits
+      FROM pick_outcomes WHERE score IS NOT NULL GROUP BY 1
+    `;
+    for (const r of bands) {
+      const n = Number(r.n);
+      const hits = Number(r.hits);
+      const hitRate = n > 0 ? (hits / n) * 100 : null;
+      const eliminated = n >= 20 && hitRate !== null && hitRate < 40;
+      if (eliminated) eliminatedBands.add(r.band);
+      bandStats.push({ band: r.band, outcomes: n, hits, hitRatePct: hitRate !== null ? Math.round(hitRate * 10) / 10 : null, eliminated });
+    }
+  } catch {
+    // Band stats failure must not block the daily run — bands stay active.
+  }
+  const bandFor = (score: number | null) =>
+    score === null ? "watch" : score >= 75 ? "strong" : score >= 60 ? "notable" : "watch";
+
   // Find the first candidate: never bought before, passing guards.
   const guarded: string[] = [];
   let candidate: any = null;
@@ -168,8 +232,10 @@ export async function POST(req: NextRequest) {
     const score = row.score === null || row.score === undefined ? null : Number(row.score);
     const change1d = row.change_1d_pct === null || row.change_1d_pct === undefined ? null : Number(row.change_1d_pct);
     const reasons: string[] = [];
-    if (score === null || score < 50) reasons.push(`score ${score === null ? "null" : score} < 50`);
+    if (score === null || score < regime.floor) reasons.push(`score ${score === null ? "null" : score} < ${regime.floor}${regime.status === "weak" ? " (regime floor, breadth " + regime.breadthPct + "%)" : ""}`);
     if (change1d !== null && change1d < -5) reasons.push(`1d ${change1d}% < -5%`);
+    const band = bandFor(score);
+    if (eliminatedBands.has(band)) reasons.push(`conviction band ${band} eliminated (${bandStats.find((b) => b.band === band)?.hitRatePct ?? "?"}% hit)`);
     if (reasons.length > 0) {
       guarded.push(`${ticker} rank ${row.rank} (${reasons.join(", ")})`);
       continue;
@@ -187,7 +253,9 @@ export async function POST(req: NextRequest) {
         weekStart,
         bought: null,
         guarded,
-        note: "every never-bought leaderboard ticker failed a buy guard (score < 50 or 1-day fall < -5%) — nothing bought today",
+        regime,
+        bandStats,
+        note: "every never-bought leaderboard ticker failed a buy guard, regime floor, or conviction-band elimination — nothing bought today",
       });
     }
     await logAttempt("skipped_all_bought", latest[0].id, null, null, null);
@@ -226,12 +294,14 @@ export async function POST(req: NextRequest) {
       RETURNING id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date
     `;
     const proposal = inserted[0];
-    await logAttempt("proposal_created", latest[0].id, ticker, candidate.rank, `score ${candidate.score ?? "—"}, price ${candidate.price ?? "—"}`);
+    await logAttempt("proposal_created", latest[0].id, ticker, candidate.rank, `score ${candidate.score ?? "—"}, price ${candidate.price ?? "—"}, regime ${regime.status} breadth ${regime.breadthPct ?? "—"}%`);
     return NextResponse.json({
       ok: true,
       weekStart,
       bought: null,
       proposal,
+      regime,
+      bandStats,
       note: "human approval required — no order placed. Approve or reject in the portfolio home.",
     });
   }
