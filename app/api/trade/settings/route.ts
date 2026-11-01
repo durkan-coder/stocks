@@ -6,7 +6,7 @@ import { isPinValid } from "@/lib/approvalPin";
 // run creates a proposal and buys nothing until the user approves
 // it in the portfolio home. 'off': the daily run buys directly as
 // before. Sells are unaffected either way — /api/trade/check
-// still closes at +5% / -3% automatically. Paper only; this is a
+// still closes at +3% / -2% automatically. Paper only; this is a
 // personal-use toggle, not an authenticated admin setting, and
 // it cannot place a trade by itself.
 export const dynamic = "force-dynamic";
