@@ -66,8 +66,39 @@ function chartPaths(values: number[], w: number, h: number, pad = 6): { line: st
   return { line, area };
 }
 
-export default async function PortfolioHome() {
+export default async function PortfolioHome({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
   const sql = neon(process.env.DATABASE_URL!);
+  // Visible result banner for approve / reject / settings actions.
+  // Those routes redirect here with ?notice=<code>&ticker=<TICKER>.
+  // Previously they redirected to plain "/" with no message, so a
+  // failed PIN and a successful buy looked identical (the PIN
+  // field just cleared). Only whitelisted codes render, and the
+  // ticker is only shown if it looks like a plain ticker symbol,
+  // so a crafted URL cannot inject arbitrary banner text.
+  const sp = searchParams ? await searchParams : {};
+  const noticeRaw = Array.isArray(sp.notice) ? sp.notice[0] : sp.notice;
+  const tickerRaw = Array.isArray(sp.ticker) ? sp.ticker[0] : sp.ticker;
+  const noticeTicker = tickerRaw && /^[A-Z]{1,6}$/.test(tickerRaw) ? tickerRaw : "";
+  const noticeText: Record<string, string> = {
+    approved: `✓ ${noticeTicker} buy approved — $100 paper order placed at the current market price. Check Open positions and the journal for the Alpaca order ID.`,
+    rejected: `✕ ${noticeTicker} proposal rejected for today only — no trade placed, and the ticker can be proposed again later.`,
+    pin_invalid: "✕ Approval PIN was not accepted — nothing was changed. Check the PIN and try again. (Never share it in chat.)",
+    guarded: `${noticeTicker} was not bought — it now fails a guard (score below 50, or a 1-day fall worse than −5%). The proposal was marked guarded and no order was placed.`,
+    alpaca_failed: `${noticeTicker} was not bought — Alpaca rejected the order. The proposal stays pending so you can retry.`,
+    expired: `${noticeTicker} proposal had expired (not from today), so nothing was bought.`,
+    already_decided: `${noticeTicker} proposal was already decided, so nothing changed.`,
+    already_bought: `${noticeTicker} was already bought before, so no duplicate order was placed.`,
+    no_proposal: "No pending proposal was found for that action — nothing was changed.",
+    settings_on: "Approval mode turned ON — the daily run will propose a trade and buy nothing until you approve it.",
+    settings_off: "Approval mode turned OFF — the daily run will buy directly, as before.",
+    settings_invalid: "Approval setting was not changed — the value was not recognised.",
+  };
+  const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
+  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off";
   const trades = await safe(
     () =>
       sql`
@@ -319,6 +350,12 @@ export default async function PortfolioHome() {
         {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) today / since purchase`}
       </div>
       <div className="meta">Invested ${invested.toFixed(2)} across {open.length} open position{open.length === 1 ? "" : "s"} · Closed P/L ${closedPlUsd >= 0 ? "+" : "−"}$${Math.abs(closedPlUsd).toFixed(2)}</div>
+
+      {notice && (
+        <div style={{ marginTop: 14, padding: "12px 14px", borderRadius: 12, border: noticeOk ? "2px solid #137333" : "2px solid #a50e0e", background: noticeOk ? "#e6f4ea" : "#fdecea", color: "#0b1f3a", fontWeight: 700, fontSize: 15 }}>
+          {notice}
+        </div>
+      )}
 
       <section className="card">
         <h2>Market regime</h2>
