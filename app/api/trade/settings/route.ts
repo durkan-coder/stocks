@@ -28,12 +28,17 @@ export async function POST(req: NextRequest) {
       value = "";
     }
   }
-  if (!isPinValid(pin)) return NextResponse.redirect(new URL("/", req.url));
-  if (value !== "on" && value !== "off") return NextResponse.redirect(new URL("/", req.url));
+  const homeWith = (notice: string) => {
+    const u = new URL("/", req.url);
+    u.searchParams.set("notice", notice);
+    return NextResponse.redirect(u);
+  };
+  if (!isPinValid(pin)) return homeWith("pin_invalid");
+  if (value !== "on" && value !== "off") return homeWith("settings_invalid");
   await sql`CREATE TABLE IF NOT EXISTS trade_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
   await sql`
     INSERT INTO trade_settings (key, value, updated_at) VALUES ('human_approval', ${value}, NOW())
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
   `;
-  return NextResponse.redirect(new URL("/", req.url));
+  return homeWith(value === "on" ? "settings_on" : "settings_off");
 }
