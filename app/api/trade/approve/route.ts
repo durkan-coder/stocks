@@ -38,34 +38,44 @@ export async function POST(req: NextRequest) {
       proposalId = null;
     }
   }
-  const home = new URL("/", req.url);
+  // Redirect home WITH a visible result notice. Previously every
+  // outcome redirected to plain "/" with no message, so a failed
+  // PIN, a guard failure and a successful buy all looked identical
+  // (the PIN field just cleared). The home page renders `notice`
+  // as a banner; only whitelisted codes are used here.
+  const homeWith = (notice: string, ticker?: string) => {
+    const u = new URL("/", req.url);
+    u.searchParams.set("notice", notice);
+    if (ticker) u.searchParams.set("ticker", ticker);
+    return NextResponse.redirect(u);
+  };
   // PIN gate, before any trade action: fail closed if APPROVAL_PIN
   // is unset or the PIN does not match. Never log the PIN value.
   if (!isPinValid(pin)) {
-    return NextResponse.redirect(home);
+    return homeWith("pin_invalid");
   }
   if (!proposalId || !Number.isFinite(proposalId)) {
-    return NextResponse.redirect(home);
+    return homeWith("no_proposal");
   }
 
   const full = await sql`
     SELECT id, ticker, leaderboard_rank, status, created_at, price_at_proposal
     FROM trade_proposals WHERE id = ${proposalId} LIMIT 1
   `;
-  if (full.length === 0) return NextResponse.redirect(home);
+  if (full.length === 0) return homeWith("no_proposal");
   const row = full[0];
   const proposal = row;
-  if (row.status !== "pending") return NextResponse.redirect(home);
+  if (row.status !== "pending") return homeWith("already_decided", row.ticker as string);
   if (new Date(row.created_at).toISOString().slice(0, 10) !== new Date().toISOString().slice(0, 10)) {
     await sql`UPDATE trade_proposals SET status = 'expired', decided_at = NOW() WHERE id = ${proposalId}`;
-    return NextResponse.redirect(home);
+    return homeWith("expired", row.ticker as string);
   }
 
   const ticker = row.ticker as string;
   const prior = await sql`SELECT id FROM paper_trades WHERE ticker = ${ticker} LIMIT 1`;
   if (prior.length > 0) {
     await sql`UPDATE trade_proposals SET status = 'superseded', decided_at = NOW() WHERE id = ${proposalId}`;
-    return NextResponse.redirect(home);
+    return homeWith("already_bought", ticker);
   }
 
   // Guard re-check against the latest scan row.
@@ -84,7 +94,7 @@ export async function POST(req: NextRequest) {
           await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
             VALUES ('trade_daily', ${latest[0].id}, ${ticker}, ${row.leaderboard_rank}, 'proposal_guarded_on_approve', ${`score ${score}, 1d ${change1d}`})`;
         } catch { /* logging must not block */ }
-        return NextResponse.redirect(home);
+        return homeWith("guarded", ticker);
       }
     }
   }
@@ -101,7 +111,7 @@ export async function POST(req: NextRequest) {
     // Leave the proposal pending so the user can retry approval
     // after fixing the cause (e.g. Alpaca outage), rather than
     // silently dropping a human-approved trade.
-    return NextResponse.redirect(home);
+    return homeWith("alpaca_failed", ticker);
   }
 
   const now = new Date();
@@ -131,5 +141,5 @@ export async function POST(req: NextRequest) {
     await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
       VALUES ('trade_daily', ${latest.length > 0 ? latest[0].id : null}, ${ticker}, ${row.leaderboard_rank}, 'bought', ${order?.id ? `order ${order.id} (human-approved)` : "human-approved"})`;
   } catch { /* logging must not block */ }
-  return NextResponse.redirect(home);
+  return homeWith("approved", ticker);
 }
