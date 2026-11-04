@@ -684,8 +684,9 @@ export interface MacroEvent {
 }
 
 /**
- * Major US macro events in the coming 7 days, from Finnhub's economic
- * calendar, filtered by keyword (CPI, FOMC/Fed, jobs, GDP, retail).
+ * Major US macro events in the caller's window (7 days, or 45 days
+ * for the watch horizon), from Finnhub's economic calendar, filtered
+ * by keyword (CPI, FOMC/Fed, jobs, GDP, retail).
  * Shown as a dashboard note only — macro moves whole sectors, it is
  * not mapped to a single ticker as a catalyst. Fail-soft: [] on error.
  */
@@ -709,7 +710,10 @@ export async function getMacroEvents(from: string, to: string): Promise<MacroEve
     const date = String(item.time ?? "").slice(0, 10) || from;
     if (!out.some((o) => o.date === date && o.event === event)) out.push({ date, event });
   }
-  return out.slice(0, 20);
+  // 60, not 20: a 45-day watch window holds far more major events
+  // than a 7-day one, and truncating at 20 would silently drop the
+  // furthest-out (most watch-relevant) events.
+  return out.slice(0, 60);
 }
 
 // -------------------------------------------------------------- sentiment

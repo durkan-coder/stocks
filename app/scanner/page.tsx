@@ -125,7 +125,20 @@ async function getData() {
         SELECT event_date, event, created_at
         FROM macro_events
         WHERE DATE(created_at) = (SELECT MAX(DATE(created_at)) FROM macro_events)
-        ORDER BY event_date ASC LIMIT 20
+        ORDER BY event_date ASC LIMIT 60
+      `,
+    [] as AnyRow[],
+  );
+  // 45-day watch horizon (display only): earnings 30-45 days out at
+  // flag time, kept until the earnings date passes. This query never
+  // feeds the leaderboard or the daily buy — it is a watchlist.
+  const earlyWatch = await safe(
+    () =>
+      sql`
+        SELECT ticker, company, event_date, eps_estimate, flag_price, flagged_date
+        FROM early_earnings_watch
+        WHERE event_date >= CURRENT_DATE
+        ORDER BY event_date ASC, ticker ASC LIMIT 100
       `,
     [] as AnyRow[],
   );
@@ -161,7 +174,7 @@ async function getData() {
     () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, baselineRows, bandRows, macro, attempts, stagger: stagger[0] ?? null, staggerState };
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, baselineRows, bandRows, macro, earlyWatch, attempts, stagger: stagger[0] ?? null, staggerState };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -227,6 +240,20 @@ function fmt(v: any) {
   return String(v);
 }
 
+// Whole days from today (UTC dates) until a DATE value. Null when
+// the value cannot be parsed — the caller then shows the date only.
+function daysUntil(v: any): number | null {
+  try {
+    const s = v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10);
+    const target = Date.parse(`${s}T00:00:00Z`);
+    const today = Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+    if (!Number.isFinite(target) || !Number.isFinite(today)) return null;
+    return Math.round((target - today) / 86400000);
+  } catch {
+    return null;
+  }
+}
+
 function scoreColor(confidence: string) {
   if (confidence === "strong") return "#137333";
   if (confidence === "notable") return "#b06000";
@@ -234,7 +261,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, baselineRows, bandRows, macro, attempts, stagger, staggerState } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, baselineRows, bandRows, macro, earlyWatch, attempts, stagger, staggerState } = await getData();
   const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
@@ -270,6 +297,8 @@ export default async function Page() {
           ["Paper trades open", String(openTrades.length)],
           ["Sector leaders", `${leaders.size} of 11 sectors`],
           ["LLM screen", screen.length ? `${screen.length} setups · ${fmt(screen[0].created_at)}` : "No screen yet"],
+          ["Early earnings watch", earlyWatch.length ? `${earlyWatch.length} tickers · earnings ${fmt(earlyWatch[0].event_date)} onwards` : "No watch rows yet"],
+          ["Macro — next 45 days", macro.length ? `${macro.length} events · next ${fmt(macro[0].event_date)}` : "No macro events yet"],
           ["Backtest hit rate", backtestRate !== null ? `${backtestRate.toFixed(1)}% (${backtestHits}/${backtestTotal})` : "No 7-day outcomes yet"],
           ["Scans shown", String(scans.length ? `${scans.length} (latest 10)` : "0")],
         ].map(([label, value]) => (
@@ -280,18 +309,47 @@ export default async function Page() {
         ))}
       </div>
       <section className="section">
-        <h2>Macro this week</h2>
-        <p className="section-note">Major US macro events in the coming 7 days (CPI, Fed/FOMC, jobs, GDP, retail). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst.</p>
+        <h2>Macro — next 45 days</h2>
+        <p className="section-note">Major US macro events in the coming 45 days (CPI, Fed/FOMC, jobs, GDP, retail, PCE). Shown as context only — macro moves whole sectors, it is not a per-ticker catalyst and never changes a score or a trade. A Fed meeting or CPI print is almost always within 45 days, so the countdown matters more than the mere presence of an event.</p>
         {macro.length === 0 ? (
-          <p>No major macro events found for this week, or the weekly macro fetch failed.</p>
+          <p>No major macro events found for the next 45 days, or the weekly macro fetch failed.</p>
         ) : (
           <div className="cards">
-            {macro.map((ev: any, i: number) => (
-              <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
-                <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
-                <div className="meta">{fmt(ev.event_date)}</div>
-              </div>
-            ))}
+            {macro.map((ev: any, i: number) => {
+              const d = daysUntil(ev.event_date);
+              return (
+                <div key={`${ev.event_date}-${ev.event}-${i}`} className="row-card">
+                  <div className="ticker" style={{ fontSize: 15 }}>{ev.event}</div>
+                  <div className="meta">{d !== null ? `in ${d} days · ` : ""}{fmt(ev.event_date)}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Early earnings watch — 30–45 days out</h2>
+        <p className="section-note">Watch only — these tickers are NOT on the buy board, carry no score, and cannot be proposed by the daily buy. Flagged by the daily /api/weekly rebuild when earnings were 30–45 days away, with the staggered price_cache price on the flag day, so drift into earnings can be measured later. Earnings dates can move — a flagged date is the calendar date at flag time.</p>
+        {earlyWatch.length === 0 ? (
+          <p>No early earnings watch rows yet. They are written by the next daily /api/weekly rebuild — earlier rebuilds did not write this table.</p>
+        ) : (
+          <div className="cards">
+            {earlyWatch.map((w: any, i: number) => {
+              const d = daysUntil(w.event_date);
+              return (
+                <div key={`${w.ticker}-${w.event_date}-${i}`} className="row-card">
+                  <div className="row-top">
+                    <div>
+                      <div className="ticker">{w.ticker}</div>
+                      <div className="company">{w.company ?? ""}</div>
+                    </div>
+                  </div>
+                  <div className="meta">Earnings {fmt(w.event_date)}{d !== null ? ` · in ${d} days` : ""}{w.eps_estimate !== null && w.eps_estimate !== undefined ? ` · EPS est ${w.eps_estimate}` : ""}</div>
+                  <div className="meta">Flagged {fmt(w.flagged_date)}{w.flag_price !== null && w.flag_price !== undefined ? ` @ $${w.flag_price}` : ""}</div>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>

@@ -193,6 +193,66 @@ export async function POST(req: NextRequest) {
     progressOk = false;
   }
 
+  // 45-DAY WATCH HORIZON (display only — never a buy signal):
+  // earnings 30-45 days out, flagged with today's staggered
+  // price_cache price so drift into earnings can be measured later.
+  // This table is never read by /api/scan or /api/trade/daily, so a
+  // watch ticker cannot reach the leaderboard or a proposal, and it
+  // carries no score and no proximity bonus. Fail-soft and placed
+  // after the shortlist + progress writes, so a watch failure (or a
+  // cron timeout inside it) can never break the buy board above.
+  // Rows stay visible until their earnings date passes; a row's
+  // flagged date/price are kept from first flagging (ON CONFLICT DO
+  // NOTHING), so re-runs cannot rewrite history. Earnings dates can
+  // move — a flagged date is the calendar date at flag time.
+  let earlyWatchTickers = 0;
+  try {
+    await sql`CREATE TABLE IF NOT EXISTS early_earnings_watch (
+      id SERIAL PRIMARY KEY,
+      ticker TEXT NOT NULL,
+      company TEXT,
+      event_date DATE NOT NULL,
+      eps_estimate NUMERIC,
+      flag_price NUMERIC,
+      flagged_date DATE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (ticker, event_date)
+    )`;
+    await sql`DELETE FROM early_earnings_watch WHERE event_date < CURRENT_DATE`;
+    const watchFrom = isoDate(addDays(now, 30));
+    const watchTo = isoDate(addDays(now, 45));
+    const watchEarnings = await getEarningsCalendar(watchFrom, watchTo);
+    const companyByTicker = new Map(constituents.map((c: any) => [c.ticker, c.company ?? null]));
+    let priceByTicker = new Map<string, number>();
+    try {
+      const cacheRows = await sql`SELECT ticker, price FROM price_cache`;
+      for (const r of cacheRows as any[]) if (r.price != null) priceByTicker.set(r.ticker, Number(r.price));
+    } catch {
+      priceByTicker = new Map();
+    }
+    const seen = new Set<string>();
+    const watchList: Array<{ ticker: string; date: string; eps: number | null }> = [];
+    for (const e of watchEarnings) {
+      const sym = e.symbol.toUpperCase();
+      if (!constituentTickers.has(sym)) continue;
+      const key = `${sym}|${e.date}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      watchList.push({ ticker: sym, date: e.date, eps: e.epsEstimate ?? null });
+    }
+    const flaggedDate = now.toISOString().slice(0, 10);
+    await mapLimit(watchList, 10, async (w) => {
+      await sql`
+        INSERT INTO early_earnings_watch (ticker, company, event_date, eps_estimate, flag_price, flagged_date)
+        VALUES (${w.ticker}, ${companyByTicker.get(w.ticker) ?? null}, ${w.date}, ${w.eps}, ${priceByTicker.get(w.ticker) ?? null}, ${flaggedDate})
+        ON CONFLICT (ticker, event_date) DO NOTHING
+      `;
+    });
+    earlyWatchTickers = watchList.length;
+  } catch {
+    earlyWatchTickers = 0;
+  }
+
   return NextResponse.json({
     ok: true,
     stage: "started",
@@ -203,6 +263,7 @@ export async function POST(req: NextRequest) {
     constituentsSource: constituentsResult.source,
     constituents: constituents.length,
     earningsInWindow: earnings.length,
+    earlyWatchTickers,
     companyNewsTickers: companyNewsByTicker.size,
     progressOk,
     nextStep: "/api/weekly/step",

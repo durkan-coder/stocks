@@ -255,8 +255,11 @@ export async function POST(req: NextRequest) {
   }
 
   // ---- finalize: macro + LLM screen ----
+  // Macro window is 45 days, not 7: the watch horizon shows the
+  // macro calendar with a days-until countdown. Macro stays
+  // context-only — it never becomes a ticker catalyst or a score.
   const from = isoDate(now);
-  const to = isoDate(addDays(now, 7));
+  const to = isoDate(addDays(now, 45));
   let macroEvents: Array<{ date: string; event: string }> = [];
   try {
     macroEvents = await getMacroEvents(from, to);
