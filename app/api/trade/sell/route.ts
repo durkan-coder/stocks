@@ -2,6 +2,7 @@ import { neon } from "@neondatabase/serverless";
 import { NextRequest, NextResponse } from "next/server";
 import { closePosition, getPositions } from "@/lib/alpaca";
 import { isPinValid } from "@/lib/approvalPin";
+import { sweepTaxReserve } from "@/lib/taxPark";
 
 // Manual sell: close one open paper position at the current market
 // price, on the user's explicit action in the portfolio home.
@@ -87,5 +88,13 @@ export async function POST(req: NextRequest) {
     await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
       VALUES ('manual_sell', NULL, ${ticker}, ${trade.leaderboard_rank}, 'sold_manual', ${`manual sell at $${exitPrice}, plpc ${plpc}`})`;
   } catch { /* logging must not block */ }
+  // Tax parking, same buy pattern as a stock buy: if this sale
+  // created (or added to) tax owed, sweep the un-parked amount
+  // into SGOV (money market ETF) as a real Alpaca paper buy. The
+  // sweep never throws and never fails the sale: a failed park
+  // just leaves the amount "awaiting parking" on the home card.
+  try {
+    await sweepTaxReserve(sql);
+  } catch { /* park failure must not block the sell result */ }
   return homeWith("sold_manual", ticker);
 }

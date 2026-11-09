@@ -104,14 +104,23 @@ export default async function PortfolioHome({
     sell_already_closed: `${noticeTicker} was already closed, so nothing changed.`,
     settings_auto_sell_on: "Automatic sells turned ON — the 15-minute check will close positions at +3% / −2% again.",
     settings_auto_sell_off: "Automatic sells turned OFF — sells are manual only. The 15-minute check watches the +3% / −2% levels and records when one is hit, but sells nothing.",
+    tax_parked: "✓ Tax reserve parked — the un-parked tax amount was used to buy SGOV (money market ETF). It now shows as a position below.",
+    tax_park_nothing: "Nothing to park right now — no tax is owed yet, or the un-parked amount is under $1 and will be swept on the next sale.",
+    tax_park_failed: "✕ The tax park buy was not placed — Alpaca rejected the order (market orders need market hours). The amount stays awaiting parking; try again during market hours.",
   };
   const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
-  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off";
+  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing";
+  // The tax-reserve column may not exist yet on the first load after
+  // deploy; create it before the SELECT below, or the SELECT fails
+  // and the whole portfolio renders empty.
+  try {
+    await sql`ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS is_tax_reserve BOOLEAN NOT NULL DEFAULT false`;
+  } catch { /* SELECT below falls back to empty on failure */ }
   const trades = await safe(
     () =>
       sql`
         SELECT id, week_start, ticker, leaderboard_rank, entry_price, notional_usd,
-               status, exit_price, pnl_pct, opened_at, closed_at
+               status, exit_price, pnl_pct, opened_at, closed_at, is_tax_reserve
         FROM paper_trades ORDER BY opened_at DESC
       `,
     [] as AnyRow[],
@@ -256,15 +265,18 @@ export default async function PortfolioHome({
     const shares = entry !== null && entry > 0 ? notional / entry : null;
     const plUsd = plPct === null ? null : (plPct / 100) * notional;
     const currentValue = current !== null && shares !== null ? shares * current : null;
-    const tp = entry === null ? null : entry * 1.03;
-    const sl = entry === null ? null : entry * 0.98;
+    // Tax-reserve (SGOV) rows are the parking vehicle, not a trade:
+    // the +3% / -2% levels never apply to them, so show no TP/SL.
+    const isReserve = Boolean(t.is_tax_reserve);
+    const tp = isReserve || entry === null ? null : entry * 1.03;
+    const sl = isReserve || entry === null ? null : entry * 0.98;
     // Sparkline: this ticker's scan prices since purchase.
     const openedMs = new Date(t.opened_at).getTime();
     const spark = historyRows
       .filter((r) => r.ticker === t.ticker && num(r.price) !== null && new Date(r.scanned_at).getTime() >= openedMs)
       .map((r) => num(r.price)!);
     const sparkPoints = spark.length >= 2 ? spark : entry !== null && current !== null ? [entry, current] : spark;
-    return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints };
+    return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints, isReserve };
   });
 
   // Portfolio value series: at each scan time, sum shares × latest
@@ -312,19 +324,27 @@ export default async function PortfolioHome({
   // Tax reserve (2026): estimated tax on REALIZED gains only, at
   // the highest federal ceiling the user chose — 40.8% short-term
   // (37% + 3.8% NIIT), 23.8% long-term (20% + 3.8% NIIT) — with
-  // losses netted first. The tax part is parked in a money market
-  // fund (ledger bucket, no fund is actually bought); the rest is
-  // available to reinvest. See lib/tax.ts for the full logic.
+  // losses netted first. The tax part is parked in SGOV (money
+  // market ETF) as a REAL Alpaca paper position, bought the same
+  // way as a stock buy; the rest is available to reinvest.
+  // See lib/tax.ts (the math) and lib/taxPark.ts (the parking).
   const taxYear = new Date().getFullYear();
   const closedThisYear = closed.filter(
     (t) => t.closed_at && new Date(t.closed_at).getFullYear() === taxYear,
   );
   const tax = computeTaxSummary(closedThisYear as any[]);
+  // Parked value = live value of the open SGOV tax-reserve
+  // positions. Awaiting = tax owed but not yet parked (small
+  // slices under the $1 buy minimum, or a park that failed).
+  const parkedValue = openRows
+    .filter((r) => r.isReserve)
+    .reduce((s, r) => s + (r.currentValue ?? 0), 0);
+  const awaitingParking = Math.max(0, tax.taxOwed - parkedValue);
   // "Sell now" preview for open winners: what the tax slice would
   // be if sold at the live price. Unrealised — no tax is owed
   // until a sale actually happens.
   const sellNowPreview = openRows
-    .filter((r) => (r.plUsd ?? 0) > 0 && r.currentValue !== null)
+    .filter((r) => !r.isReserve && (r.plUsd ?? 0) > 0 && r.currentValue !== null)
     .map((r) => ({
       ticker: r.t.ticker,
       gainUsd: r.plUsd as number,
@@ -525,8 +545,8 @@ export default async function PortfolioHome({
                   const spark = chartPaths(r.spark, 100, 32, 2);
                   const sparkColor = (r.plPct ?? 0) >= 0 ? "#137333" : "#a50e0e";
                   return (
-                    <tr key={r.t.ticker}>
-                      <td className="ticker">{r.t.ticker}<div className="meta" style={{ marginTop: 0 }}>{r.source}</div></td>
+                    <tr key={`${r.t.ticker}-${r.t.id}`}>
+                      <td className="ticker">{r.t.ticker}<div className="meta" style={{ marginTop: 0 }}>{r.isReserve ? "Money market — tax reserve" : r.source}</div></td>
                       <td>
                         {r.spark.length >= 2 ? (
                           <svg viewBox="0 0 100 32" width="100" height="32"><path d={spark.line} fill="none" stroke={sparkColor} strokeWidth="2" strokeLinejoin="round" /></svg>
@@ -553,7 +573,7 @@ export default async function PortfolioHome({
             </table>
           </div>
         )}
-        <p className="note">Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit.</p>
+        <p className="note">Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit. An SGOV row is your parked tax reserve (money market ETF), not a trade — the +3% / −2% levels never apply to it, and selling it is how you withdraw the parked money at tax time.</p>
       </section>
 
       <section className="card">
@@ -575,17 +595,20 @@ export default async function PortfolioHome({
                   // $0 on a loss). The headline tax owed in the Tax
                   // reserve card is NETTED across trades, so these
                   // slices can sum above it when losses exist.
+                  // Tax-reserve (SGOV) rows are the parking vehicle:
+                  // no tax is charged on them, net = full proceeds.
+                  const isReserve = Boolean(t.is_tax_reserve);
                   const rate = taxRateFor(t);
-                  const taxSlice = usd === null || usd <= 0 ? 0 : usd * rate;
+                  const taxSlice = isReserve || usd === null || usd <= 0 ? 0 : usd * rate;
                   const net = usd === null ? null : notional + usd - taxSlice;
                   return (
                     <tr key={`${t.ticker}-${i}`}>
-                      <td className="ticker">{t.ticker}</td>
+                      <td className="ticker">{t.ticker}{isReserve ? <div className="meta" style={{ marginTop: 0 }}>Money market — tax reserve</div> : null}</td>
                       <td>{t.entry_price ?? "—"}</td>
                       <td>{t.exit_price ?? "—"}</td>
                       <td style={{ color: plColor(pct), fontWeight: 700 }}>{usd === null ? "—" : `${usd >= 0 ? "+" : "−"}$${Math.abs(usd).toFixed(2)}`}</td>
                       <td style={{ color: plColor(pct), fontWeight: 700 }}>{pct === null ? "—" : `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(2)}%`}</td>
-                      <td>${taxSlice.toFixed(2)} <span className="meta">({(rate * 100).toFixed(1)}%)</span></td>
+                      <td>{isReserve ? "—" : <>${taxSlice.toFixed(2)} <span className="meta">({(rate * 100).toFixed(1)}%)</span></>}</td>
                       <td style={{ fontWeight: 700 }}>{net === null ? "—" : `$${net.toFixed(2)}`}</td>
                       <td>{t.status}</td>
                       <td>{fmtDate(t.closed_at)}</td>
@@ -611,14 +634,24 @@ export default async function PortfolioHome({
             <div className="stat"><div className="stat-label">Realized losses</div><div className="stat-value">${tax.stLosses + tax.ltLosses === 0 ? "0.00" : (tax.stLosses + tax.ltLosses).toFixed(2)}</div></div>
             <div className="stat"><div className="stat-label">Net taxable gain</div><div className="stat-value">${(tax.taxableSt + tax.taxableLt).toFixed(2)}</div></div>
             <div className="stat"><div className="stat-label">Estimated tax owed</div><div className="stat-value">${tax.taxOwed.toFixed(2)}</div></div>
-            <div className="stat"><div className="stat-label">Parked in money market fund</div><div className="stat-value">${tax.taxReserve.toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Parked in SGOV (live value)</div><div className="stat-value">${parkedValue.toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Awaiting parking</div><div className="stat-value">${awaitingParking.toFixed(2)}</div></div>
             <div className="stat"><div className="stat-label">Available to reinvest</div><div className="stat-value">${tax.reinvestable.toFixed(2)}</div></div>
           </div>
         )}
         {tax.tradeCount > 0 && (
           <p className="meta" style={{ marginTop: 8 }}>
-            Short-term net ${tax.stNet.toFixed(2)} · Long-term net ${tax.ltNet.toFixed(2)} · Sale proceeds ${tax.totalProceeds.toFixed(2)} — tax ${tax.taxOwed.toFixed(2)} is parked, the remaining ${tax.reinvestable.toFixed(2)} is available to reinvest.
+            Short-term net ${tax.stNet.toFixed(2)} · Long-term net ${tax.ltNet.toFixed(2)} · Sale proceeds ${tax.totalProceeds.toFixed(2)} — tax ${tax.taxOwed.toFixed(2)} owed, ${parkedValue.toFixed(2)} parked in SGOV, ${awaitingParking.toFixed(2)} awaiting parking, and the remaining ${tax.reinvestable.toFixed(2)} is available to reinvest.
           </p>
+        )}
+        {awaitingParking >= 1 && (
+          <form method="post" action="/api/trade/tax-park" style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+            <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #0b1f3a", background: "#0b1f3a", color: "#fff", fontSize: 14, cursor: "pointer" }}>
+              Park ${awaitingParking.toFixed(2)} in SGOV now
+            </button>
+            <span className="meta" style={{ marginTop: 0 }}>Buys SGOV at the market price, the same way a stock buy works. Future sales park automatically — this button is only for what is still waiting.</span>
+          </form>
         )}
         {sellNowPreview.length > 0 && (
           <>
@@ -628,7 +661,7 @@ export default async function PortfolioHome({
             </div>
           </>
         )}
-        <p className="note">Estimate for planning only — not tax advice. Your actual bill depends on your full income, filing status, and state. The parked amount is a paper ledger bucket labelled as a money market fund (capital preserved, no yield assumed); no fund is actually bought in the paper account — in live trading, move that amount to your money market fund when you sell. Wash sales are not tracked.</p>
+        <p className="note">Estimate for planning only — not tax advice. Your actual bill depends on your full income, filing status, and state. The parked money is a real SGOV position (iShares 0-3 Month Treasury Bond ETF — T-bills, price near $100, monthly dividend; Alpaca has no money market fund product, so this is the closest parking vehicle). Selling the SGOV position is how you withdraw the parked money at tax time. Wash sales are not tracked.</p>
       </section>
 
       <nav className="bottom-nav">

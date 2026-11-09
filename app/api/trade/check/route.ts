@@ -27,12 +27,22 @@ export async function POST(req: NextRequest) {
 
   const sql = neon(process.env.DATABASE_URL!);
 
+  // Tax-reserve (SGOV) rows are the parking vehicle, not trading
+  // positions: the +3% / -2% levels never apply to them and this
+  // route must never sell them. The column may not exist yet on
+  // the first run after deploy, so create it idempotently first.
+  try {
+    await sql`ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS is_tax_reserve BOOLEAN NOT NULL DEFAULT false`;
+  } catch { /* stock rows are treated as non-reserve below */ }
+
   // Check the DB first: with no open trades there is nothing to check,
   // so do NOT call Alpaca at all. Previously this route called Alpaca
   // unconditionally, so a bad Alpaca key / Alpaca outage made even an
   // empty check return 500 instead of a clean "nothing to do".
   const open = await sql`
-    SELECT id, ticker FROM paper_trades WHERE status = 'open' ORDER BY opened_at ASC
+    SELECT id, ticker FROM paper_trades
+    WHERE status = 'open' AND (is_tax_reserve IS NULL OR is_tax_reserve = false)
+    ORDER BY opened_at ASC
   `;
   if (open.length === 0) {
     return NextResponse.json({ ok: true, autoSell: false, closed: [], stillOpen: [], watching: [], note: "no open paper trades — Alpaca not called" });

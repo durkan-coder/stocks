@@ -69,6 +69,28 @@ export async function placeNotionalBuy(symbol: string, notional = TRADE_NOTIONAL
   });
 }
 
+// Tax-park buy: same order shape as a stock buy (market, notional,
+// fractional), but the amount is the tax slice from a sale, not the
+// fixed $100 — so it deliberately does NOT go through the $100
+// guard above. Minimum $1 (Alpaca's fractional minimum); smaller
+// slices stay as "awaiting parking" until they add up to $1.
+export const TAX_PARK_MIN_NOTIONAL_USD = 1;
+export async function placeParkBuy(symbol: string, notional: number) {
+  if (!Number.isFinite(notional) || notional < TAX_PARK_MIN_NOTIONAL_USD) {
+    throw new Error("Park buy needs at least $1");
+  }
+  return alpaca("/v2/orders", {
+    method: "POST",
+    body: JSON.stringify({
+      symbol,
+      notional: String(notional.toFixed(2)),
+      side: "buy",
+      type: "market",
+      time_in_force: "day",
+    }),
+  });
+}
+
 export async function closePosition(symbol: string) {
   // Closes the whole position at market, whatever its size.
   return alpaca(`/v2/positions/${symbol}`, { method: "DELETE" });

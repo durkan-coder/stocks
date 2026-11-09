@@ -37,6 +37,10 @@ export interface TaxTradeLike {
   notional_usd: number | string | null;
   opened_at: string | Date | null;
   closed_at: string | Date | null;
+  // Tax-reserve (money market) trades are the parking vehicle, not
+  // trading gains: selling SGOV to pay a tax bill must not create
+  // new tax. computeTaxSummary skips them.
+  is_tax_reserve?: boolean | null;
 }
 
 function num(v: number | string | null | undefined): number | null {
@@ -113,7 +117,12 @@ export interface TaxSummary {
 }
 
 export function computeTaxSummary(trades: TaxTradeLike[]): TaxSummary {
-  const rows: TaxTradeRow[] = trades.map((t) => {
+  // Tax-reserve rows (SGOV buys/sells) are excluded: they are the
+  // parking vehicle, and their tiny price moves are not trading
+  // gains to be taxed again.
+  const rows: TaxTradeRow[] = trades
+    .filter((t) => !t.is_tax_reserve)
+    .map((t) => {
     const gain = tradeGainUsd(t);
     const proceeds = tradeProceedsUsd(t);
     const longTerm = isLongTerm(t);
