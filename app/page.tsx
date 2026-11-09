@@ -1,6 +1,7 @@
 import { neon } from "@neondatabase/serverless";
 import { getPositions } from "@/lib/alpaca";
 import { computeTaxSummary, LONG_TERM_TAX_RATE, SHORT_TERM_TAX_RATE, taxRateFor } from "@/lib/tax";
+import { repairParkedEntries } from "@/lib/taxPark";
 
 // Portfolio home (Robinhood-style): positions first. This is the
 // app's home screen — the scanner dashboard lives at /scanner.
@@ -116,11 +117,19 @@ export default async function PortfolioHome({
   try {
     await sql`ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS is_tax_reserve BOOLEAN NOT NULL DEFAULT false`;
   } catch { /* SELECT below falls back to empty on failure */ }
+  // Self-heal: a park buy placed before extended_hours (or one
+  // that had not filled yet) can leave an SGOV row with no entry
+  // price, which renders as a row of dashes. Backfill it from the
+  // order/quote before reading the trades below. Never blocks the
+  // page if Alpaca is unreachable.
+  try {
+    await repairParkedEntries(sql);
+  } catch { /* the row just renders as before */ }
   const trades = await safe(
     () =>
       sql`
         SELECT id, week_start, ticker, leaderboard_rank, entry_price, notional_usd,
-               status, exit_price, pnl_pct, opened_at, closed_at, is_tax_reserve
+               status, exit_price, pnl_pct, opened_at, closed_at, is_tax_reserve, alpaca_order_id
         FROM paper_trades ORDER BY opened_at DESC
       `,
     [] as AnyRow[],
@@ -260,6 +269,16 @@ export default async function PortfolioHome({
       current = num(boardByTicker.get(t.ticker)!.price);
       if (entry !== null && current !== null) plPct = ((current - entry) / entry) * 100;
       source = "Latest board";
+    }
+    // Tax-reserve rows are not on the board or in the staggered
+    // cache, and the live position only exists once the buy fills.
+    // Until then, value the row at its entry price (SGOV barely
+    // moves) so it shows its parked value instead of dashes.
+    const isReserveEarly = Boolean(t.is_tax_reserve);
+    if (current === null && isReserveEarly && entry !== null) {
+      current = entry;
+      plPct = 0;
+      source = "Pending fill — entry price";
     }
     const notional = num(t.notional_usd) ?? 100;
     const shares = entry !== null && entry > 0 ? notional / entry : null;

@@ -74,6 +74,13 @@ export async function placeNotionalBuy(symbol: string, notional = TRADE_NOTIONAL
 // fixed $100 — so it deliberately does NOT go through the $100
 // guard above. Minimum $1 (Alpaca's fractional minimum); smaller
 // slices stay as "awaiting parking" until they add up to $1.
+//
+// extended_hours: true — the park is not a trade to time, it is
+// money being set aside. Without it, a tap after the 4pm ET close
+// (e.g. the first Park tap, 2:37pm PT = 5:37pm ET) places an order
+// that cannot fill until the next open, and the position shows up
+// blank in the meantime. SGOV is a T-bill ETF; its after-hours
+// spread is pennies, so filling immediately is the right trade.
 export const TAX_PARK_MIN_NOTIONAL_USD = 1;
 export async function placeParkBuy(symbol: string, notional: number) {
   if (!Number.isFinite(notional) || notional < TAX_PARK_MIN_NOTIONAL_USD) {
@@ -87,8 +94,36 @@ export async function placeParkBuy(symbol: string, notional: number) {
       side: "buy",
       type: "market",
       time_in_force: "day",
+      extended_hours: true,
     }),
   });
+}
+
+export async function getOrder(orderId: string) {
+  return alpaca(`/v2/orders/${orderId}`);
+}
+
+// Latest trade price from Alpaca's data API (same paper keys).
+// Used only as a fallback entry price for a park buy that has not
+// filled yet — SGOV's price barely moves, so the quote is within
+// pennies of the eventual fill.
+export async function getLatestTradePrice(symbol: string): Promise<number | null> {
+  const { base, key, secret } = (() => {
+    const b = process.env.ALPACA_PAPER_URL ?? "https://paper-api.alpaca.markets";
+    return { base: b.replace(/\/$/, ""), key: process.env.ALPACA_PAPER_KEY, secret: process.env.ALPACA_PAPER_SECRET };
+  })();
+  if (!key || !secret || !base.includes("paper-api.alpaca.markets")) return null;
+  try {
+    const res = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/trades/latest`, {
+      headers: { "APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret },
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const p = Number(j?.trade?.p);
+    return Number.isFinite(p) ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function closePosition(symbol: string) {

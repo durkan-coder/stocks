@@ -33,7 +33,7 @@
 //  - Selling an SGOV position from the home Sell button is how
 //    the parked money is withdrawn at tax time.
 
-import { getPositions, placeParkBuy, TAX_PARK_MIN_NOTIONAL_USD } from "@/lib/alpaca";
+import { getLatestTradePrice, getOrder, getPositions, placeParkBuy, TAX_PARK_MIN_NOTIONAL_USD } from "@/lib/alpaca";
 import { computeTaxSummary, tradeProceedsUsd } from "@/lib/tax";
 
 export const TAX_PARK_TICKER = "SGOV";
@@ -98,8 +98,60 @@ export interface SweepResult {
   reason: string; // "parked" | "nothing_owed" | "below_minimum" | "alpaca_failed" | "record_failed"
 }
 
+// Repair open SGOV rows whose entry price was never recorded
+// (a park buy placed after hours, before extended_hours, had no
+// fill price and no live position yet, so entry_price stayed null
+// and the position rendered as a row of dashes). For each such
+// row: if its Alpaca order filled, use the fill price; if the
+// order is still live, use the latest quote as a pending-fill
+// entry (SGOV barely moves); if the order died, delete the row —
+// the buy never happened, so the money returns to "awaiting
+// parking" and the next sweep re-parks it. Never throws.
+export async function repairParkedEntries(sql: any): Promise<void> {
+  try {
+    await ensureTaxReserveColumn(sql);
+    const rows = await sql`
+      SELECT id, alpaca_order_id FROM paper_trades
+      WHERE ticker = ${TAX_PARK_TICKER} AND is_tax_reserve = true
+        AND status = 'open' AND entry_price IS NULL
+    `;
+    for (const r of rows) {
+      try {
+        const orderId = r.alpaca_order_id as string | null;
+        let entry: number | null = null;
+        let dead = false;
+        if (orderId) {
+          try {
+            const o = await getOrder(orderId);
+            const st = String(o?.status ?? "");
+            if (st === "filled") {
+              const f = Number(o?.filled_avg_price);
+              entry = Number.isFinite(f) ? f : null;
+            } else if (st === "canceled" || st === "expired" || st === "rejected") {
+              dead = true;
+            }
+          } catch { /* fall through to the quote */ }
+        }
+        if (dead) {
+          await sql`DELETE FROM paper_trades WHERE id = ${r.id}`;
+          try {
+            await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
+              VALUES ('tax_park', NULL, ${TAX_PARK_TICKER}, NULL, 'park_order_dead', ${`order ${orderId} died before filling — row removed, amount returns to awaiting parking`})`;
+          } catch { /* logging must not block */ }
+          continue;
+        }
+        if (entry === null) entry = await getLatestTradePrice(TAX_PARK_TICKER);
+        if (entry !== null && Number.isFinite(entry)) {
+          await sql`UPDATE paper_trades SET entry_price = ${entry} WHERE id = ${r.id}`;
+        }
+      } catch { /* one bad row must not block the rest */ }
+    }
+  } catch { /* repair must never break the caller */ }
+}
+
 export async function sweepTaxReserve(sql: any): Promise<SweepResult> {
   try {
+    await repairParkedEntries(sql);
     const status = await reserveStatus(sql);
     if (status.unparked < 0.005) return { parked: 0, orderId: null, reason: "nothing_owed" };
     if (status.unparked < TAX_PARK_MIN_USD) return { parked: 0, orderId: null, reason: "below_minimum" };
@@ -117,19 +169,27 @@ export async function sweepTaxReserve(sql: any): Promise<SweepResult> {
       return { parked: 0, orderId: null, reason: "alpaca_failed" };
     }
 
-    // Entry price: the Alpaca position's average entry is the
-    // authoritative fill price; fall back to the order's filled
-    // average, then to the current SGOV price.
+    // Entry price: the order's fill price first, then the live
+    // position's average entry, then the latest quote (a buy that
+    // has not filled yet — e.g. placed just now — still needs an
+    // entry price, or the row renders blank). SGOV barely moves,
+    // so the quote is within pennies of the eventual fill, and
+    // repairParkedEntries() corrects it to the real fill price
+    // once the order fills.
     let entryPrice: number | null = null;
-    try {
-      const positions = await getPositions();
-      const pos = positions.find((p: any) => p.symbol === TAX_PARK_TICKER);
-      if (pos) entryPrice = Number(pos.avg_entry_price);
-    } catch { /* fall through to the order fields */ }
-    if (entryPrice === null || !Number.isFinite(entryPrice)) {
-      const filled = Number(order?.filled_avg_price ?? NaN);
-      entryPrice = Number.isFinite(filled) ? filled : null;
+    const filled = Number(order?.filled_avg_price ?? NaN);
+    if (Number.isFinite(filled)) entryPrice = filled;
+    if (entryPrice === null) {
+      try {
+        const positions = await getPositions();
+        const pos = positions.find((p: any) => p.symbol === TAX_PARK_TICKER);
+        if (pos) {
+          const avg = Number(pos.avg_entry_price);
+          if (Number.isFinite(avg)) entryPrice = avg;
+        }
+      } catch { /* fall through to the quote */ }
     }
+    if (entryPrice === null) entryPrice = await getLatestTradePrice(TAX_PARK_TICKER);
 
     const now = new Date();
     const monday = new Date(now);
