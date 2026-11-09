@@ -584,7 +584,7 @@ export default async function PortfolioHome({
                       <td>{t.entry_price ?? "—"}</td>
                       <td>{t.exit_price ?? "—"}</td>
                       <td style={{ color: plColor(pct), fontWeight: 700 }}>{usd === null ? "—" : `${usd >= 0 ? "+" : "−"}$${Math.abs(usd).toFixed(2)}`}</td>
-                      <td style={{ color: plColor(pct), fontWeight: 700 }}>{pct === null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</td>
+                      <td style={{ color: plColor(pct), fontWeight: 700 }}>{pct === null ? "—" : `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(2)}%`}</td>
                       <td>${taxSlice.toFixed(2)} <span className="meta">({(rate * 100).toFixed(1)}%)</span></td>
                       <td style={{ fontWeight: 700 }}>{net === null ? "—" : `$${net.toFixed(2)}`}</td>
                       <td>{t.status}</td>
