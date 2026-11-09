@@ -17,8 +17,9 @@ import { isPinValid } from "@/lib/approvalPin";
 //  4. Only then is the Alpaca order placed, at the CURRENT market
 //     price for $100 notional (the proposal price is a reference,
 //     not a limit — a market order cannot guarantee it).
-// Sells are NOT gated here: /api/trade/check still closes at
-// +3% / -2% automatically.
+// Sells are NOT gated here: sells are manual (2026-11-09) via
+// /api/trade/sell; /api/trade/check only watches +3% / -2% and
+// records alerts while automatic sells are off.
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {

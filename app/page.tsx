@@ -96,13 +96,20 @@ export default async function PortfolioHome({
     settings_on: "Approval mode turned ON — the daily run will propose a trade and buy nothing until you approve it.",
     settings_off: "Approval mode turned OFF — the daily run will buy directly, as before.",
     settings_invalid: "Approval setting was not changed — the value was not recognised.",
+    sold_manual: `✓ ${noticeTicker} sold manually — the whole position was closed at the current market price. Check Closed positions and the journal for the exit price and P/L.`,
+    sell_no_trade: "No open position was found for that sell — nothing was changed.",
+    sell_no_position: `${noticeTicker} has no live Alpaca position to close — left open in the records. Check the journal; the broker position may already be gone.`,
+    sell_alpaca_failed: `${noticeTicker} was not sold — Alpaca rejected the close. The position stays open so you can retry.`,
+    sell_already_closed: `${noticeTicker} was already closed, so nothing changed.`,
+    settings_auto_sell_on: "Automatic sells turned ON — the 15-minute check will close positions at +3% / −2% again.",
+    settings_auto_sell_off: "Automatic sells turned OFF — sells are manual only. The 15-minute check watches the +3% / −2% levels and records when one is hit, but sells nothing.",
   };
   const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
-  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off";
+  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off";
   const trades = await safe(
     () =>
       sql`
-        SELECT week_start, ticker, leaderboard_rank, entry_price, notional_usd,
+        SELECT id, week_start, ticker, leaderboard_rank, entry_price, notional_usd,
                status, exit_price, pnl_pct, opened_at, closed_at
         FROM paper_trades ORDER BY opened_at DESC
       `,
@@ -147,12 +154,19 @@ export default async function PortfolioHome({
   // server-side until the user sets it and redeploys.
   const pinConfigured = Boolean(process.env.APPROVAL_PIN);
   let approvalOn = true;
+  // Automatic sells: OFF unless explicitly turned on (manual-only
+  // default since 2026-11-09). Missing row = off, matching
+  // /api/trade/check, which is watch-only while this is off.
+  let autoSellOn = false;
   try {
     await sql`CREATE TABLE IF NOT EXISTS trade_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
     const setting = await sql`SELECT value FROM trade_settings WHERE key = 'human_approval' LIMIT 1`;
     if (setting.length > 0) approvalOn = setting[0].value !== "off";
+    const autoSetting = await sql`SELECT value FROM trade_settings WHERE key = 'auto_sell' LIMIT 1`;
+    if (autoSetting.length > 0) autoSellOn = autoSetting[0].value === "on";
   } catch {
     approvalOn = true;
+    autoSellOn = false;
   }
   const pendingProposals = await safe(
     () =>
@@ -285,10 +299,13 @@ export default async function PortfolioHome({
   const currentTotal = openRows.reduce((s, r) => s + (r.currentValue ?? 0), 0);
   const totalPlUsd = openRows.reduce((s, r) => s + (r.plUsd ?? 0), 0);
   const totalPlPct = invested > 0 ? (totalPlUsd / invested) * 100 : null;
+  // pnl_pct is stored as a FRACTION (e.g. 0.032), matching the
+  // check/sell routes and the journal — so $ P/L is pct * notional,
+  // not pct / 100 * notional.
   const closedPlUsd = closed.reduce((s, t) => {
     const pct = num(t.pnl_pct);
     const notional = num(t.notional_usd) ?? 100;
-    return s + (pct === null ? 0 : (pct / 100) * notional);
+    return s + (pct === null ? 0 : pct * notional);
   }, 0);
 
   const chartValues = portfolioSeries.map((p) => p.value);
@@ -372,7 +389,7 @@ export default async function PortfolioHome({
           Approval mode is <strong>{approvalOn ? "ON" : "OFF"}</strong>. {approvalOn
             ? "The daily run proposes a trade and buys nothing until you approve it here."
             : "The daily run buys directly, as before."}{" "}
-          Sells are always automatic at +3% / −2% — waiting to approve a stop could let a gain reverse or a loss deepen.
+          Sells are manual — a position closes only when you press Sell on it below. Automatic +3% / −2% sells are <strong>{autoSellOn ? "ON" : "OFF"}</strong>.
         </p>
         {!pinConfigured && (
           <p className="meta" style={{ color: "#a50e0e", fontWeight: 700 }}>
@@ -380,11 +397,21 @@ export default async function PortfolioHome({
           </p>
         )}
         <form method="post" action="/api/trade/settings" style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="hidden" name="key" value="human_approval" />
           <input type="hidden" name="value" value={approvalOn ? "off" : "on"} />
           <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
           <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #0b1f3a", background: "#0b1f3a", color: "#fff", fontSize: 14, cursor: "pointer" }}>
             Turn approval {approvalOn ? "OFF" : "ON"}
           </button>
+        </form>
+        <form method="post" action="/api/trade/settings" style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="hidden" name="key" value="auto_sell" />
+          <input type="hidden" name="value" value={autoSellOn ? "off" : "on"} />
+          <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+          <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #a50e0e", background: "#fff", color: "#a50e0e", fontSize: 14, cursor: "pointer" }}>
+            Turn automatic sells {autoSellOn ? "OFF" : "ON"}
+          </button>
+          <span className="meta" style={{ marginTop: 0 }}>Automatic sells are {autoSellOn ? "ON — the 15-minute check closes at +3% / −2%." : "OFF — sells are manual only, and the 15-minute check only watches the levels."}</span>
         </form>
         {proposal ? (
           <div style={{ marginTop: 16, border: "2px solid #0b1f3a", borderRadius: 14, padding: 14 }}>
@@ -467,7 +494,7 @@ export default async function PortfolioHome({
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Take profit</th><th>Stop loss</th></tr>
+                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Take profit</th><th>Stop loss</th><th>Sell</th></tr>
               </thead>
               <tbody>
                 {openRows.map((r) => {
@@ -488,6 +515,13 @@ export default async function PortfolioHome({
                       <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plPct === null ? "—" : `${r.plPct >= 0 ? "+" : ""}${r.plPct.toFixed(2)}%`}</td>
                       <td>${r.tp === null ? "—" : r.tp.toFixed(2)}</td>
                       <td>${r.sl === null ? "—" : r.sl.toFixed(2)}</td>
+                      <td>
+                        <form method="post" action="/api/trade/sell" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="hidden" name="tradeId" value={String(r.t.id)} />
+                          <input type="password" name="pin" placeholder="PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ccc", fontSize: 13, width: 84 }} />
+                          <button type="submit" style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #a50e0e", background: "#a50e0e", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Sell</button>
+                        </form>
+                      </td>
                     </tr>
                   );
                 })}
@@ -495,7 +529,7 @@ export default async function PortfolioHome({
             </table>
           </div>
         )}
-        <p className="note">Sell rule: +3% take profit, −2% stop loss, checked every 15 minutes. A gap at the open can close beyond −2% — the stop limits, but does not guarantee, the loss.</p>
+        <p className="note">Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit.</p>
       </section>
 
       <section className="card">
@@ -512,7 +546,7 @@ export default async function PortfolioHome({
                 {closed.map((t: any, i: number) => {
                   const pct = num(t.pnl_pct);
                   const notional = num(t.notional_usd) ?? 100;
-                  const usd = pct === null ? null : (pct / 100) * notional;
+                  const usd = pct === null ? null : pct * notional;
                   return (
                     <tr key={`${t.ticker}-${i}`}>
                       <td className="ticker">{t.ticker}</td>

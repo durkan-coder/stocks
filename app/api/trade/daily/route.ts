@@ -16,12 +16,12 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 // This replaces the old weekly top-3 buy — do NOT run both jobs, or
 // the same day could buy twice.
 //
-// Sell rule is unchanged and lives in /api/trade/check: a position is
-// closed at +3% (take profit) or -2% (stop loss), based on Alpaca's
-// unrealised P/L, with no waiting for an earnings trigger event.
-// Sells stay AUTOMATIC — waiting for a human to approve a stop-loss
-// could let a +3% gain reverse or a -2% loss deepen. Human approval
-// gates BUYS only.
+// Sell rule: MANUAL only since 2026-11-09 (Durkan's choice).
+// /api/trade/check watches the +3% (take profit) / -2% (stop loss)
+// levels against Alpaca's unrealised P/L and records alerts, but
+// sells nothing while automatic sells are off. A position closes
+// only when the user presses Sell in the portfolio home
+// (/api/trade/sell). Human approval gates BUYS only.
 //
 // Buy guards (added 2026-10-30, Durkan-approved before the Mon Nov 2
 // buy, after AAPL's valuation warnings and AMD's -12.5% day): a ticker
