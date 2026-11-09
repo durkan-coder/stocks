@@ -69,22 +69,48 @@ export async function placeNotionalBuy(symbol: string, notional = TRADE_NOTIONAL
   });
 }
 
-// Tax-park buy: same order shape as a stock buy (market, notional,
-// fractional), but the amount is the tax slice from a sale, not the
-// fixed $100 — so it deliberately does NOT go through the $100
-// guard above. Minimum $1 (Alpaca's fractional minimum); smaller
-// slices stay as "awaiting parking" until they add up to $1.
+// Tax-park buy: same idea as a stock buy (notional, fractional),
+// but the amount is the tax slice from a sale, not the fixed $100
+// — so it deliberately does NOT go through the $100 guard above.
+// Minimum $1 (Alpaca's fractional minimum); smaller slices stay
+// as "awaiting parking" until they add up to $1.
 //
-// extended_hours: true — the park is not a trade to time, it is
-// money being set aside. Without it, a tap after the 4pm ET close
-// (e.g. the first Park tap, 2:37pm PT = 5:37pm ET) places an order
-// that cannot fill until the next open, and the position shows up
-// blank in the meantime. SGOV is a T-bill ETF; its after-hours
-// spread is pennies, so filling immediately is the right trade.
+// Order type matters here (Alpaca docs, "Placing Orders"):
+//
+//   "Only limit orders with time_in_force set to day or gtc are
+//   accepted as extended hours eligible. Any other type of orders
+//   will be rejected" — so a MARKET order with extended_hours is
+//   rejected after hours, not filled. The first Park tap (2:37pm
+//   PT = 5:37pm ET) was a plain market order, which Alpaca
+//   accepted and queued for the next session instead.
+//
+// So park buys are LIMIT orders: limit = last trade price + $0.05
+// (SGOV barely moves, so that fills immediately in regular hours
+// and after hours alike), day TIF, extended_hours eligible. If no
+// quote is available, fall back to a plain market order (no
+// extended_hours): it fills in regular hours and queues for the
+// next session after hours — safe, and repairParkedEntries()
+// cleans up if it never fills.
 export const TAX_PARK_MIN_NOTIONAL_USD = 1;
 export async function placeParkBuy(symbol: string, notional: number) {
   if (!Number.isFinite(notional) || notional < TAX_PARK_MIN_NOTIONAL_USD) {
     throw new Error("Park buy needs at least $1");
+  }
+  const last = await getLatestTradePrice(symbol);
+  if (last !== null) {
+    const limit = Math.ceil((last + 0.05) * 100) / 100;
+    return alpaca("/v2/orders", {
+      method: "POST",
+      body: JSON.stringify({
+        symbol,
+        notional: String(notional.toFixed(2)),
+        side: "buy",
+        type: "limit",
+        limit_price: String(limit.toFixed(2)),
+        time_in_force: "day",
+        extended_hours: true,
+      }),
+    });
   }
   return alpaca("/v2/orders", {
     method: "POST",
@@ -94,7 +120,6 @@ export async function placeParkBuy(symbol: string, notional: number) {
       side: "buy",
       type: "market",
       time_in_force: "day",
-      extended_hours: true,
     }),
   });
 }

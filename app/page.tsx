@@ -107,7 +107,7 @@ export default async function PortfolioHome({
     settings_auto_sell_off: "Automatic sells turned OFF — sells are manual only. The 15-minute check watches the +3% / −2% levels and records when one is hit, but sells nothing.",
     tax_parked: "✓ Tax reserve parked — the un-parked tax amount was used to buy SGOV (money market ETF). It now shows as a position below.",
     tax_park_nothing: "Nothing to park right now — no tax is owed yet, or the un-parked amount is under $1 and will be swept on the next sale.",
-    tax_park_failed: "✕ The tax park buy was not placed — Alpaca rejected the order (market orders need market hours). The amount stays awaiting parking; try again during market hours.",
+    tax_park_failed: "✕ The tax park buy was not placed — Alpaca did not accept the order. The amount stays awaiting parking; try again later or during market hours.",
   };
   const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
   const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing";
