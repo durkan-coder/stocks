@@ -1,5 +1,6 @@
 import { neon } from "@neondatabase/serverless";
 import { getPositions } from "@/lib/alpaca";
+import { computeTaxSummary, LONG_TERM_TAX_RATE, SHORT_TERM_TAX_RATE, taxRateFor } from "@/lib/tax";
 
 // Portfolio home (Robinhood-style): positions first. This is the
 // app's home screen — the scanner dashboard lives at /scanner.
@@ -308,6 +309,29 @@ export default async function PortfolioHome({
     return s + (pct === null ? 0 : pct * notional);
   }, 0);
 
+  // Tax reserve (2026): estimated tax on REALIZED gains only, at
+  // the highest federal ceiling the user chose — 40.8% short-term
+  // (37% + 3.8% NIIT), 23.8% long-term (20% + 3.8% NIIT) — with
+  // losses netted first. The tax part is parked in a money market
+  // fund (ledger bucket, no fund is actually bought); the rest is
+  // available to reinvest. See lib/tax.ts for the full logic.
+  const taxYear = new Date().getFullYear();
+  const closedThisYear = closed.filter(
+    (t) => t.closed_at && new Date(t.closed_at).getFullYear() === taxYear,
+  );
+  const tax = computeTaxSummary(closedThisYear as any[]);
+  // "Sell now" preview for open winners: what the tax slice would
+  // be if sold at the live price. Unrealised — no tax is owed
+  // until a sale actually happens.
+  const sellNowPreview = openRows
+    .filter((r) => (r.plUsd ?? 0) > 0 && r.currentValue !== null)
+    .map((r) => ({
+      ticker: r.t.ticker,
+      gainUsd: r.plUsd as number,
+      taxUsd: (r.plUsd as number) * SHORT_TERM_TAX_RATE,
+      proceedsUsd: r.currentValue as number,
+    }));
+
   const chartValues = portfolioSeries.map((p) => p.value);
   const chart = chartPaths(chartValues, 600, 180);
   const chartColor = (totalPlPct ?? 0) >= 0 ? "#137333" : "#a50e0e";
@@ -540,13 +564,20 @@ export default async function PortfolioHome({
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th className="ticker">Stock</th><th>Entry</th><th>Exit</th><th>P/L $</th><th>P/L %</th><th>Status</th><th>Closed</th></tr>
+                <tr><th className="ticker">Stock</th><th>Entry</th><th>Exit</th><th>P/L $</th><th>P/L %</th><th>Tax</th><th>Net</th><th>Status</th><th>Closed</th></tr>
               </thead>
               <tbody>
                 {closed.map((t: any, i: number) => {
                   const pct = num(t.pnl_pct);
                   const notional = num(t.notional_usd) ?? 100;
                   const usd = pct === null ? null : pct * notional;
+                  // Tax slice for this trade alone (gain x its rate,
+                  // $0 on a loss). The headline tax owed in the Tax
+                  // reserve card is NETTED across trades, so these
+                  // slices can sum above it when losses exist.
+                  const rate = taxRateFor(t);
+                  const taxSlice = usd === null || usd <= 0 ? 0 : usd * rate;
+                  const net = usd === null ? null : notional + usd - taxSlice;
                   return (
                     <tr key={`${t.ticker}-${i}`}>
                       <td className="ticker">{t.ticker}</td>
@@ -554,6 +585,8 @@ export default async function PortfolioHome({
                       <td>{t.exit_price ?? "—"}</td>
                       <td style={{ color: plColor(pct), fontWeight: 700 }}>{usd === null ? "—" : `${usd >= 0 ? "+" : "−"}$${Math.abs(usd).toFixed(2)}`}</td>
                       <td style={{ color: plColor(pct), fontWeight: 700 }}>{pct === null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</td>
+                      <td>${taxSlice.toFixed(2)} <span className="meta">({(rate * 100).toFixed(1)}%)</span></td>
+                      <td style={{ fontWeight: 700 }}>{net === null ? "—" : `$${net.toFixed(2)}`}</td>
                       <td>{t.status}</td>
                       <td>{fmtDate(t.closed_at)}</td>
                     </tr>
@@ -563,6 +596,39 @@ export default async function PortfolioHome({
             </table>
           </div>
         )}
+      </section>
+
+      <section className="card">
+        <h2>Tax reserve — {taxYear}</h2>
+        <p className="meta">
+          Estimated tax on realized gains only, at the highest federal ceiling: <strong>{(SHORT_TERM_TAX_RATE * 100).toFixed(1)}% short-term</strong> (37% + 3.8% NIIT) and <strong>{(LONG_TERM_TAX_RATE * 100).toFixed(1)}% long-term</strong> (20% + 3.8% NIIT). Losses are netted against gains first. Federal only — no state tax included.
+        </p>
+        {tax.tradeCount === 0 ? (
+          <p className="meta">No sales yet in {taxYear} — the reserve fills when you sell a position. The preview below shows what the tax slice would be if you sold a winner now.</p>
+        ) : (
+          <div className="stats" style={{ marginTop: 10 }}>
+            <div className="stat"><div className="stat-label">Realized gains</div><div className="stat-value">${(tax.stGains + tax.ltGains).toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Realized losses</div><div className="stat-value">${tax.stLosses + tax.ltLosses === 0 ? "0.00" : (tax.stLosses + tax.ltLosses).toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Net taxable gain</div><div className="stat-value">${(tax.taxableSt + tax.taxableLt).toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Estimated tax owed</div><div className="stat-value">${tax.taxOwed.toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Parked in money market fund</div><div className="stat-value">${tax.taxReserve.toFixed(2)}</div></div>
+            <div className="stat"><div className="stat-label">Available to reinvest</div><div className="stat-value">${tax.reinvestable.toFixed(2)}</div></div>
+          </div>
+        )}
+        {tax.tradeCount > 0 && (
+          <p className="meta" style={{ marginTop: 8 }}>
+            Short-term net ${tax.stNet.toFixed(2)} · Long-term net ${tax.ltNet.toFixed(2)} · Sale proceeds ${tax.totalProceeds.toFixed(2)} — tax ${tax.taxOwed.toFixed(2)} is parked, the remaining ${tax.reinvestable.toFixed(2)} is available to reinvest.
+          </p>
+        )}
+        {sellNowPreview.length > 0 && (
+          <>
+            <p className="meta" style={{ marginTop: 12, fontWeight: 700 }}>If you sold now (preview — unrealised, no tax until you sell):</p>
+            <div className="meta">
+              {sellNowPreview.map((p) => `${p.ticker}: gain $${p.gainUsd.toFixed(2)} → tax $${p.taxUsd.toFixed(2)} parked, $${(p.proceedsUsd - p.taxUsd).toFixed(2)} to reinvest`).join(" · ")}
+            </div>
+          </>
+        )}
+        <p className="note">Estimate for planning only — not tax advice. Your actual bill depends on your full income, filing status, and state. The parked amount is a paper ledger bucket labelled as a money market fund (capital preserved, no yield assumed); no fund is actually bought in the paper account — in live trading, move that amount to your money market fund when you sell. Wash sales are not tracked.</p>
       </section>
 
       <nav className="bottom-nav">
