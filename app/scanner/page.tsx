@@ -417,6 +417,7 @@ export default async function Page() {
       <section className="section">
         <h2>Missed movers — ≥5% today</h2>
         <p className="section-note">Every SPY name that moved 5% or more today, from the after-close /api/movers/daily sweep of the staggered price cache. “Missed” means it was on none of today’s shortlist, leaderboard, open positions or proposals — the names the scanner never saw. “On board” means the scanner had it (whether or not it was bought). The reason is the top company-news headline plus any earnings in the last 7 days, quoted verbatim — never invented. If no news and no recent earnings were found, it says so instead of guessing.</p>
+        <p className="meta"><a href="/movers">Full 30-day history and weekly review →</a></p>
         {missedMovers.length === 0 ? (
           <p>No missed-movers run yet. The sweep runs once a day after the close (13:15 PT) — see /api/movers/daily. Until its first run this section stays honestly empty.</p>
         ) : (
@@ -795,6 +796,7 @@ export default async function Page() {
           { id: "shortlist", label: "Shortlist", icon: "🎯", node: shortlistTab },
           { id: "trades", label: "Trades", icon: "💼", node: tradesTab },
           { id: "positions", label: "Positions", icon: "📈", href: "/" },
+          { id: "movers", label: "Movers", icon: "🎯", href: "/movers" },
           { id: "backtest", label: "Backtest", icon: "🧪", node: backtestTab },
           { id: "coverage", label: "Coverage", icon: "🌐", node: coverageTab },
           { id: "ask", label: "Ask", icon: "💬", node: askTab },
