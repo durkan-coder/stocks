@@ -91,6 +91,95 @@ export async function POST(req: NextRequest) {
     top50 = selectTop50(events);
   }
 
+  // POST-EARNINGS LEG (added 2026-11-10, Durkan: watch + buy-eligible):
+  // tickers that reported in the last 7 days stay on the board as
+  // post-earnings drift candidates. This is what catches CHTR
+  // (reported Nov 6, +10.6% on Nov 10, day 4) and TTWO (reported
+  // Nov 9 after close, +8.3% Nov 10 on GTA VI preorders), which the
+  // upcoming-only window deleted the morning they moved. They get a
+  // reserved slice of the board: upcoming earnings keep the top 40
+  // slots, post-earnings names take up to 10, total cap 50. They
+  // compete for the daily buy on their enriched leaderboard score
+  // like any other row — the START score only buys them a slot.
+  // A name is only eligible while fresh (reported within 7 days)
+  // and never bought before (a held/closed name wastes a slot).
+  // The past-7-day calendar call also backfills the watch table on
+  // the first run after deploy (Finnhub's calendar takes a past
+  // range), so recent reporters are recovered, not lost.
+  let postWatchTickers = 0;
+  try {
+    await sql`CREATE TABLE IF NOT EXISTS post_earnings_watch (
+      id SERIAL PRIMARY KEY,
+      ticker TEXT NOT NULL,
+      company TEXT,
+      event_date DATE NOT NULL,
+      eps_estimate NUMERIC,
+      flag_price NUMERIC,
+      flagged_date DATE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (ticker, event_date)
+    )`;
+    const postFrom = isoDate(addDays(now, -7));
+    const postTo = isoDate(addDays(now, -1));
+    const pastEarnings = await getEarningsCalendar(postFrom, postTo);
+    // Today's reporters are still in the upcoming window (from =
+    // today), so they reach the board as "earnings" today and as
+    // "post_earnings" from tomorrow.
+    const companyByTicker2 = new Map(constituents.map((c: any) => [c.ticker, c.company ?? null]));
+    let priceByTicker2 = new Map<string, number>();
+    try {
+      const cacheRows = await sql`SELECT ticker, price FROM price_cache`;
+      for (const r of cacheRows as any[]) if (r.price != null) priceByTicker2.set(r.ticker, Number(r.price));
+    } catch {
+      priceByTicker2 = new Map();
+    }
+    const seenPost = new Set<string>();
+    const postList: Array<{ ticker: string; date: string; eps: number | null }> = [];
+    for (const e of pastEarnings) {
+      const sym = e.symbol.toUpperCase();
+      if (!constituentTickers.has(sym)) continue;
+      const key = `${sym}|${e.date}`;
+      if (seenPost.has(key)) continue;
+      seenPost.add(key);
+      postList.push({ ticker: sym, date: e.date, eps: e.epsEstimate ?? null });
+    }
+    const flaggedDate2 = now.toISOString().slice(0, 10);
+    await mapLimit(postList, 10, async (w) => {
+      await sql`
+        INSERT INTO post_earnings_watch (ticker, company, event_date, eps_estimate, flag_price, flagged_date)
+        VALUES (${w.ticker}, ${companyByTicker2.get(w.ticker) ?? null}, ${w.date}, ${w.eps}, ${priceByTicker2.get(w.ticker) ?? null}, ${flaggedDate2})
+        ON CONFLICT (ticker, event_date) DO NOTHING
+      `;
+    });
+    await sql`DELETE FROM post_earnings_watch WHERE event_date < CURRENT_DATE - INTERVAL '7 days'`;
+    const upcoming = top50.slice(0, 40);
+    const upcomingTickers = new Set(upcoming.map((e) => e.ticker));
+    let boughtTickers = new Set<string>();
+    try {
+      const bought = await sql`SELECT DISTINCT ticker FROM paper_trades`;
+      boughtTickers = new Set((bought as any[]).map((r: any) => r.ticker as string));
+    } catch {
+      boughtTickers = new Set();
+    }
+    const postEvents: CatalystEvent[] = postList
+      .filter((w) => !upcomingTickers.has(w.ticker) && !boughtTickers.has(w.ticker))
+      .map((w) => ({
+        ticker: w.ticker,
+        company: companyByTicker2.get(w.ticker) ?? undefined,
+        type: "post_earnings" as const,
+        eventDate: w.date,
+        detail: `Reported ${w.date}${w.eps !== null && w.eps !== undefined ? `, EPS est ${w.eps}` : ""} — earnings out, post-earnings drift candidate.`,
+        impact: 75,
+        certainty: 90,
+        sources: "Finnhub earnings calendar (past 7 days)",
+      }));
+    const postTop = selectTop50(postEvents).slice(0, 10);
+    postWatchTickers = postTop.length;
+    top50 = [...upcoming, ...postTop];
+  } catch {
+    postWatchTickers = 0;
+  }
+
   const monday = new Date(now);
   const day = now.getUTCDay(); // 0 = Sunday
   monday.setUTCDate(now.getUTCDate() - ((day + 6) % 7));
@@ -264,6 +353,7 @@ export async function POST(req: NextRequest) {
     constituents: constituents.length,
     earningsInWindow: earnings.length,
     earlyWatchTickers,
+    postEarningsTickers: postWatchTickers,
     companyNewsTickers: companyNewsByTicker.size,
     progressOk,
     nextStep: "/api/weekly/step",

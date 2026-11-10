@@ -79,6 +79,26 @@ export async function POST(req: NextRequest) {
     return homeWith("already_bought", ticker);
   }
 
+  // Daily buy cap (multi-buy, 2026-11-10): at most daily_buy_count
+  // buys per day. Count today's non-reserve paper_trades by
+  // opened_at (SGOV tax-reserve rows are not buys). The cap is
+  // enforced at creation by /api/trade/daily; this is the backstop
+  // for a setting lowered mid-day after proposals were created.
+  // A failed count read fails open — it must not strand a valid
+  // approval on a database hiccup.
+  try {
+    let cap = 1;
+    const capSetting = await sql`SELECT value FROM trade_settings WHERE key = 'daily_buy_count' LIMIT 1`;
+    if (capSetting.length > 0) {
+      const n = parseInt(String(capSetting[0].value), 10);
+      if (Number.isFinite(n)) cap = Math.max(1, Math.min(5, n));
+    }
+    const boughtToday = await sql`SELECT COUNT(*)::int AS n FROM paper_trades WHERE DATE(opened_at) = CURRENT_DATE AND ticker <> 'SGOV'`;
+    if (Number(boughtToday[0]?.n ?? 0) >= cap) return homeWith("daily_limit", ticker);
+  } catch {
+    // Fall through to the guard re-check and buy.
+  }
+
   // Guard re-check against the latest scan row.
   const latest = await sql`SELECT id FROM scans ORDER BY id DESC LIMIT 1`;
   if (latest.length > 0) {

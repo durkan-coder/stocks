@@ -142,6 +142,34 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
+  // Post-earnings watch (buy-eligible since 2026-11-10): reported
+  // in the last 7 days, on the board as drift candidates. Joined
+  // to price_cache so the move since flagging can be shown.
+  const postWatch = await safe(
+    () =>
+      sql`
+        SELECT w.ticker, w.company, w.event_date, w.eps_estimate, w.flag_price, w.flagged_date,
+               c.price AS current_price
+        FROM post_earnings_watch w
+        LEFT JOIN price_cache c ON c.ticker = w.ticker
+        WHERE w.event_date >= CURRENT_DATE - INTERVAL '7 days'
+        ORDER BY w.event_date DESC, w.ticker ASC LIMIT 50
+      `,
+    [] as AnyRow[],
+  );
+  // Missed movers (written daily after close by /api/movers/daily):
+  // SPY names that moved >= 5% today, with whether the scanner had
+  // them on the board and the reason for the move.
+  const missedMovers = await safe(
+    () =>
+      sql`
+        SELECT mover_date, ticker, company, move_pct, direction, missed, reason, sources
+        FROM missed_movers
+        WHERE mover_date = (SELECT MAX(mover_date) FROM missed_movers)
+        ORDER BY ABS(move_pct) DESC, ticker ASC LIMIT 50
+      `,
+    [] as AnyRow[],
+  );
   const attempts = await safe(
     () =>
       sql`
@@ -174,7 +202,7 @@ async function getData() {
     () => sql`SELECT job, slice, updated_at FROM stagger_state ORDER BY job ASC`,
     [] as AnyRow[],
   );
-  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, baselineRows, bandRows, macro, earlyWatch, attempts, stagger: stagger[0] ?? null, staggerState };
+  return { scans, latestScan, board, shortlist, trades, screen, backtestAgg: backtestAgg[0] ?? null, backtestRecent, baselineRows, bandRows, macro, earlyWatch, postWatch, missedMovers, attempts, stagger: stagger[0] ?? null, staggerState };
 }
 
 // GICS sector leaders: for each of the 11 official GICS sectors, the
@@ -261,7 +289,7 @@ function scoreColor(confidence: string) {
 }
 
 export default async function Page() {
-  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, baselineRows, bandRows, macro, earlyWatch, attempts, stagger, staggerState } = await getData();
+  const { scans, latestScan, board, shortlist, trades, screen, backtestAgg, backtestRecent, baselineRows, bandRows, macro, earlyWatch, postWatch, missedMovers, attempts, stagger, staggerState } = await getData();
   const backtestTotal = backtestAgg ? Number(backtestAgg.total) : 0;
   const backtestHits = backtestAgg ? Number(backtestAgg.hits) : 0;
   const backtestRate = backtestTotal > 0 ? (backtestHits / backtestTotal) * 100 : null;
@@ -298,6 +326,8 @@ export default async function Page() {
           ["Sector leaders", `${leaders.size} of 11 sectors`],
           ["LLM screen", screen.length ? `${screen.length} setups · ${fmt(screen[0].created_at)}` : "No screen yet"],
           ["Early earnings watch", earlyWatch.length ? `${earlyWatch.length} tickers · earnings ${fmt(earlyWatch[0].event_date)} onwards` : "No watch rows yet"],
+          ["Just reported", postWatch.length ? `${postWatch.length} tickers · reported ${fmt(postWatch[0].event_date)} onwards` : "No rows yet"],
+          ["Missed movers ≥5%", missedMovers.length ? `${missedMovers.length} movers · ${fmt(missedMovers[0].mover_date)}` : "No run yet"],
           ["Macro — next 45 days", macro.length ? `${macro.length} events · next ${fmt(macro[0].event_date)}` : "No macro events yet"],
           ["Backtest hit rate", backtestRate !== null ? `${backtestRate.toFixed(1)}% (${backtestHits}/${backtestTotal})` : "No 7-day outcomes yet"],
           ["Scans shown", String(scans.length ? `${scans.length} (latest 10)` : "0")],
@@ -347,6 +377,65 @@ export default async function Page() {
                   </div>
                   <div className="meta">Earnings {fmt(w.event_date)}{d !== null ? ` · in ${d} days` : ""}{w.eps_estimate !== null && w.eps_estimate !== undefined ? ` · EPS est ${w.eps_estimate}` : ""}</div>
                   <div className="meta">Flagged {fmt(w.flagged_date)}{w.flag_price !== null && w.flag_price !== undefined ? ` @ $${w.flag_price}` : ""}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Just reported — post-earnings watch</h2>
+        <p className="section-note">Buy-eligible, not display-only: these tickers reported in the last 7 days and hold up to 10 of the 50 shortlist slots (upcoming earnings keep the top 40), so they compete for the daily buy on their leaderboard score like any other row. This is the CHTR/TTWO fix — both moved days after reporting, when the upcoming-only window had already deleted them. A name drops off 7 days after its report; a name already bought never takes a slot. Flag price is the staggered price_cache price when first flagged, so the move shown is drift since flagging, not since the report itself.</p>
+        {postWatch.length === 0 ? (
+          <p>No just-reported rows yet. They are written by the next daily /api/weekly rebuild — the past-7-day earnings calendar backfills recent reporters on the first run.</p>
+        ) : (
+          <div className="cards">
+            {postWatch.map((w: any, i: number) => {
+              const d = daysUntil(w.event_date);
+              const ago = d !== null ? -d : null;
+              const flag = w.flag_price !== null && w.flag_price !== undefined ? Number(w.flag_price) : null;
+              const cur = w.current_price !== null && w.current_price !== undefined ? Number(w.current_price) : null;
+              const move = flag !== null && cur !== null && flag !== 0 ? ((cur - flag) / flag) * 100 : null;
+              return (
+                <div key={`${w.ticker}-${w.event_date}-${i}`} className="row-card">
+                  <div className="row-top">
+                    <div>
+                      <div className="ticker">{w.ticker}</div>
+                      <div className="company">{w.company ?? ""}</div>
+                    </div>
+                  </div>
+                  <div className="meta">Reported {fmt(w.event_date)}{ago !== null ? ` · ${ago} day${ago === 1 ? "" : "s"} ago` : ""}{w.eps_estimate !== null && w.eps_estimate !== undefined ? ` · EPS est ${w.eps_estimate}` : ""}</div>
+                  <div className="meta">Flagged {fmt(w.flagged_date)}{flag !== null ? ` @ $${flag.toFixed(2)}` : ""}{cur !== null ? ` · now $${cur.toFixed(2)}` : ""}{move !== null ? ` · ${move >= 0 ? "+" : ""}${move.toFixed(2)}% since flag` : ""}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="section">
+        <h2>Missed movers — ≥5% today</h2>
+        <p className="section-note">Every SPY name that moved 5% or more today, from the after-close /api/movers/daily sweep of the staggered price cache. “Missed” means it was on none of today’s shortlist, leaderboard, open positions or proposals — the names the scanner never saw. “On board” means the scanner had it (whether or not it was bought). The reason is the top company-news headline plus any earnings in the last 7 days, quoted verbatim — never invented. If no news and no recent earnings were found, it says so instead of guessing.</p>
+        {missedMovers.length === 0 ? (
+          <p>No missed-movers run yet. The sweep runs once a day after the close (13:15 PT) — see /api/movers/daily. Until its first run this section stays honestly empty.</p>
+        ) : (
+          <div className="cards">
+            {missedMovers.map((m: any, i: number) => {
+              const pct = Number(m.move_pct);
+              const up = pct >= 0;
+              return (
+                <div key={`${m.ticker}-${m.mover_date}-${i}`} className="row-card">
+                  <div className="row-top">
+                    <div>
+                      <div className="ticker">{m.ticker}</div>
+                      <div className="company">{m.company ?? ""}</div>
+                    </div>
+                    <div style={{ fontWeight: 800, color: up ? "#137333" : "#a50e0e" }}>{up ? "+" : ""}{pct.toFixed(2)}%</div>
+                  </div>
+                  <div className="meta">{m.missed ? "⚠️ Missed by us" : "✓ On board"} · {fmt(m.mover_date)}</div>
+                  <div className="meta">{m.reason ?? ""}</div>
+                  {m.sources ? <div className="meta">Source: {m.sources}</div> : null}
                 </div>
               );
             })}

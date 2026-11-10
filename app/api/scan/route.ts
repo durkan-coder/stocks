@@ -270,9 +270,13 @@ export async function POST(req: NextRequest) {
         const today = new Date();
         today.setUTCHours(0, 0, 0, 0);
         daysToEvent = Math.round((ev - today.getTime()) / (24 * 3600 * 1000));
+        // Past dates get NO bonus: a report already out cannot be
+        // "due soon". (The old code gave +7 to any past date via the
+        // bare `<= 4` / `<= 7` branches — wrong for post-earnings
+        // rows, which now exist on the board.)
         if (daysToEvent >= 0 && daysToEvent <= 2) catalystScore = Math.min(100, catalystScore + 10);
-        else if (daysToEvent <= 4) catalystScore = Math.min(100, catalystScore + 7);
-        else if (daysToEvent <= 7) catalystScore = Math.min(100, catalystScore + 4);
+        else if (daysToEvent >= 0 && daysToEvent <= 4) catalystScore = Math.min(100, catalystScore + 7);
+        else if (daysToEvent >= 0 && daysToEvent <= 7) catalystScore = Math.min(100, catalystScore + 4);
       }
     }
 

@@ -2,8 +2,10 @@ import { neon } from "@neondatabase/serverless";
 import { NextRequest, NextResponse } from "next/server";
 import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 
-// Daily paper buy: ONE unique stock per day, from the latest
-// leaderboard scan, in rank order.
+// Daily paper buy: up to N unique stocks per day (N = trade_settings
+// 'daily_buy_count', 1-5, default 1 — added 2026-11-10, Durkan:
+// "buy multiple stocks in a day"), from the latest leaderboard
+// scan, in rank order.
 // Triggered by cron-job.org once per trading day (e.g. 09:52 ET,
 // after the 09:45 ET scan has landed, so it does not race the scan).
 // Same CRON_SECRET protection as the other trade routes. Paper only.
@@ -38,18 +40,19 @@ import { placeNotionalBuy, TRADE_NOTIONAL_USD } from "@/lib/alpaca";
 //
 // HUMAN-IN-THE-LOOP (added 2026-10-30, Durkan: approve trades):
 // By default (trade_settings human_approval = 'on', or no setting
-// row yet) this route does NOT place an order. It writes a
-// trade_proposals row for the first candidate that passes the
-// guards and returns it. The user approves or rejects it in the
-// portfolio home (/), via /api/trade/approve or /api/trade/reject.
+// row yet) this route does NOT place an order. It writes one
+// trade_proposals row per candidate that passes the guards (up to
+// the daily_buy_count, 1-5, default 1) and returns them. The user
+// approves or rejects each in the portfolio home (/), via
+// /api/trade/approve or /api/trade/reject.
 // Approval re-checks the guards against the CURRENT leaderboard
 // row before placing the order, so a ticker that has since fallen
 // or dropped in score cannot be approved on stale data. If
 // human_approval is set to 'off' (toggle on /), this route buys
 // directly as before. A proposal is only valid on the day it was
 // created — an old pending proposal cannot be approved the next
-// day, and a new daily run does not create a duplicate while
-// today's proposal is still pending. No buy, and no proposal,
+// day, and a new daily run tops up to the daily count instead of
+// creating duplicates beyond it. No buy, and no proposal,
 // happens for a ticker already bought before.
 export const dynamic = "force-dynamic";
 
@@ -111,7 +114,24 @@ export async function POST(req: NextRequest) {
     approvalOn = true;
   }
 
-  // Today's pending proposal, if any — do not create a duplicate.
+  // Buys per day (added 2026-11-10, Durkan: buy multiple stocks a
+  // day): trade_settings 'daily_buy_count', integer 1-5, default 1.
+  // Set on the portfolio home (PIN-gated). The run proposes/buys
+  // up to this many never-bought tickers, in rank order, $100 each.
+  let dailyBuyCount = 1;
+  try {
+    const countSetting = await sql`SELECT value FROM trade_settings WHERE key = 'daily_buy_count' LIMIT 1`;
+    if (countSetting.length > 0) {
+      const n = parseInt(String(countSetting[0].value), 10);
+      if (Number.isFinite(n)) dailyBuyCount = Math.max(1, Math.min(5, n));
+    }
+  } catch {
+    dailyBuyCount = 1;
+  }
+
+  // Today's pending proposals, if any — top up to the daily count,
+  // do not create duplicates beyond it.
+  let slots = dailyBuyCount;
   try {
     await sql`CREATE TABLE IF NOT EXISTS trade_proposals (
       id SERIAL PRIMARY KEY,
@@ -131,13 +151,14 @@ export async function POST(req: NextRequest) {
         SELECT id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date
         FROM trade_proposals
         WHERE status = 'pending' AND DATE(created_at) = CURRENT_DATE
-        ORDER BY created_at DESC LIMIT 1
+        ORDER BY created_at ASC
       `;
-      if (pending.length > 0) {
+      if (pending.length >= dailyBuyCount) {
         const p = pending[0];
-        await logAttempt("proposal_exists", latest[0].id, p.ticker, p.leaderboard_rank, null);
-        return NextResponse.json({ ok: true, weekStart: null, bought: null, proposal: p, note: "today's proposal is still pending human approval — no duplicate created" });
+        await logAttempt("proposal_exists", latest[0].id, p.ticker, p.leaderboard_rank, `${pending.length} proposal(s) already pending today (limit ${dailyBuyCount})`);
+        return NextResponse.json({ ok: true, weekStart: null, bought: null, proposals: pending, proposal: p, note: `today's proposals already pending (${pending.length}/${dailyBuyCount}) — no duplicates created` });
       }
+      slots = dailyBuyCount - pending.length;
     }
   } catch {
     // Proposal table failure must not block an auto-buy when approval is off;
@@ -220,10 +241,11 @@ export async function POST(req: NextRequest) {
   const bandFor = (score: number | null) =>
     score === null ? "watch" : score >= 75 ? "strong" : score >= 60 ? "notable" : "watch";
 
-  // Find the first candidate: never bought before, passing guards.
+  // Find up to `slots` candidates: never bought before, passing guards.
   const guarded: string[] = [];
-  let candidate: any = null;
+  const candidates: any[] = [];
   for (const row of rows) {
+    if (candidates.length >= slots) break;
     const ticker = row.ticker as string;
     const prior = await sql`
       SELECT id FROM paper_trades WHERE ticker = ${ticker} LIMIT 1
@@ -240,11 +262,10 @@ export async function POST(req: NextRequest) {
       guarded.push(`${ticker} rank ${row.rank} (${reasons.join(", ")})`);
       continue;
     }
-    candidate = row;
-    break;
+    candidates.push(row);
   }
 
-  if (!candidate) {
+  if (candidates.length === 0) {
     if (guarded.length > 0) {
       const detail = `guarded: ${guarded.join("; ")}`.slice(0, 300);
       await logAttempt("skipped_by_guard", latest[0].id, null, null, detail);
@@ -267,67 +288,77 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  const ticker = candidate.ticker as string;
-
   // Human-in-the-loop: propose, do not buy.
   if (approvalOn) {
-    // Event date / type from the latest shortlist row for context
-    // on the proposal card (e.g. "earnings in 2 days").
-    let eventDate: string | null = null;
-    let catalystType: string | null = null;
-    try {
-      const s = await sql`
-        SELECT event_date, catalyst_type FROM weekly_shortlist
-        WHERE ticker = ${ticker} ORDER BY created_at DESC LIMIT 1
-      `;
-      if (s.length > 0) {
-        eventDate = s[0].event_date ? new Date(s[0].event_date).toISOString().slice(0, 10) : null;
-        catalystType = s[0].catalyst_type ?? null;
+    const proposals: any[] = [];
+    for (const candidate of candidates) {
+      const ticker = candidate.ticker as string;
+      // Event date / type from the latest shortlist row for context
+      // on the proposal card (e.g. "earnings in 2 days").
+      let eventDate: string | null = null;
+      let catalystType: string | null = null;
+      try {
+        const s = await sql`
+          SELECT event_date, catalyst_type FROM weekly_shortlist
+          WHERE ticker = ${ticker} ORDER BY created_at DESC LIMIT 1
+        `;
+        if (s.length > 0) {
+          eventDate = s[0].event_date ? new Date(s[0].event_date).toISOString().slice(0, 10) : null;
+          catalystType = s[0].catalyst_type ?? null;
+        }
+      } catch {
+        // Context only — a missing event date must not block the proposal.
       }
-    } catch {
-      // Context only — a missing event date must not block the proposal.
+      const inserted = await sql`
+        INSERT INTO trade_proposals
+          (ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date, status)
+        VALUES (${ticker}, ${candidate.rank}, ${candidate.score ?? null}, ${candidate.price ?? null}, ${candidate.catalyst ?? null}, ${catalystType}, ${eventDate}, 'pending')
+        RETURNING id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date
+      `;
+      const proposal = inserted[0];
+      proposals.push(proposal);
+      await logAttempt("proposal_created", latest[0].id, ticker, candidate.rank, `score ${candidate.score ?? "—"}, price ${candidate.price ?? "—"}, regime ${regime.status} breadth ${regime.breadthPct ?? "—"}%`);
     }
-    const inserted = await sql`
-      INSERT INTO trade_proposals
-        (ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date, status)
-      VALUES (${ticker}, ${candidate.rank}, ${candidate.score ?? null}, ${candidate.price ?? null}, ${candidate.catalyst ?? null}, ${catalystType}, ${eventDate}, 'pending')
-      RETURNING id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date
-    `;
-    const proposal = inserted[0];
-    await logAttempt("proposal_created", latest[0].id, ticker, candidate.rank, `score ${candidate.score ?? "—"}, price ${candidate.price ?? "—"}, regime ${regime.status} breadth ${regime.breadthPct ?? "—"}%`);
     return NextResponse.json({
       ok: true,
       weekStart,
       bought: null,
-      proposal,
+      proposals,
+      proposal: proposals[0] ?? null,
       regime,
       bandStats,
-      note: "human approval required — no order placed. Approve or reject in the portfolio home.",
+      note: `human approval required — ${proposals.length} proposal(s) created, no order placed. Approve or reject in the portfolio home.`,
     });
   }
 
-  // Approval off: direct buy, as before.
-  let order: any;
-  try {
-    order = await placeNotionalBuy(ticker, TRADE_NOTIONAL_USD);
-  } catch (e: any) {
-    const detail = String(e?.message ?? e).slice(0, 300);
-    await logAttempt("alpaca_buy_failed", latest[0].id, ticker, candidate.rank, detail);
-    return NextResponse.json(
-      { ok: false, error: "alpaca_buy_failed", ticker, detail },
-      { status: 502 },
-    );
+  // Approval off: direct buys, one per candidate, $100 each. A
+  // single failed buy must not block the others — each is logged.
+  const bought: any[] = [];
+  const failed: any[] = [];
+  for (const candidate of candidates) {
+    const ticker = candidate.ticker as string;
+    let order: any;
+    try {
+      order = await placeNotionalBuy(ticker, TRADE_NOTIONAL_USD);
+    } catch (e: any) {
+      const detail = String(e?.message ?? e).slice(0, 300);
+      failed.push({ ticker, rank: candidate.rank, detail });
+      await logAttempt("alpaca_buy_failed", latest[0].id, ticker, candidate.rank, detail);
+      continue;
+    }
+    await logAttempt("bought", latest[0].id, ticker, candidate.rank, order?.id ? `order ${order.id}` : null);
+    await sql`
+      INSERT INTO paper_trades
+        (week_start, ticker, leaderboard_rank, entry_price, notional_usd, alpaca_order_id, status)
+      VALUES (${weekStart}, ${ticker}, ${candidate.rank}, ${candidate.price ?? null}, ${TRADE_NOTIONAL_USD}, ${order?.id ?? null}, 'open')
+    `;
+    bought.push({ ticker, rank: candidate.rank, notional: TRADE_NOTIONAL_USD, orderId: order?.id ?? null });
   }
-  await logAttempt("bought", latest[0].id, ticker, candidate.rank, order?.id ? `order ${order.id}` : null);
-  await sql`
-    INSERT INTO paper_trades
-      (week_start, ticker, leaderboard_rank, entry_price, notional_usd, alpaca_order_id, status)
-    VALUES (${weekStart}, ${ticker}, ${candidate.rank}, ${candidate.price ?? null}, ${TRADE_NOTIONAL_USD}, ${order?.id ?? null}, 'open')
-  `;
   return NextResponse.json({
     ok: true,
     weekStart,
-    bought: { ticker, rank: candidate.rank, notional: TRADE_NOTIONAL_USD, orderId: order?.id ?? null },
+    bought,
+    failed,
   });
 }
 

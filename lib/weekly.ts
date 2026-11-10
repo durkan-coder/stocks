@@ -6,6 +6,7 @@
 
 export type CatalystType =
   | "earnings"
+  | "post_earnings"
   | "guidance"
   | "macro"
   | "geopolitical"

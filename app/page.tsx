@@ -105,12 +105,14 @@ export default async function PortfolioHome({
     sell_already_closed: `${noticeTicker} was already closed, so nothing changed.`,
     settings_auto_sell_on: "Automatic sells turned ON — the 15-minute check will close positions at +3% / −2% again.",
     settings_auto_sell_off: "Automatic sells turned OFF — sells are manual only. The 15-minute check watches the +3% / −2% levels and records when one is hit, but sells nothing.",
+    daily_limit: `${noticeTicker} was not bought — today's buy limit is already reached. Raise "Buys per day" to approve more.`,
+    settings_daily_count: "Buys per day updated — the daily run will now propose (or buy) up to that many tickers a day, $100 each.",
     tax_parked: "✓ Tax reserve parked — the un-parked tax amount was used to buy SGOV (money market ETF). It now shows as a position below.",
     tax_park_nothing: "Nothing to park right now — no tax is owed yet, or the un-parked amount is under $1 and will be swept on the next sale.",
     tax_park_failed: "✕ The tax park buy was not placed — Alpaca did not accept the order. The amount stays awaiting parking; try again later or during market hours.",
   };
   const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
-  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing";
+  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing" || noticeRaw === "settings_daily_count";
   // The tax-reserve column may not exist yet on the first load after
   // deploy; create it before the SELECT below, or the SELECT fails
   // and the whole portfolio renders empty.
@@ -139,7 +141,7 @@ export default async function PortfolioHome({
   const live = await safe(() => getPositions(), [] as any[]);
   for (const p of live) liveByTicker.set(p.symbol, p);
 
-  const cache = await safe(() => sql`SELECT ticker, price, updated_at FROM price_cache`, [] as AnyRow[]);
+  const cache = await safe(() => sql`SELECT ticker, price, change_pct, updated_at FROM price_cache`, [] as AnyRow[]);
   const cacheByTicker = new Map<string, AnyRow>();
   for (const c of cache) cacheByTicker.set(c.ticker, c);
 
@@ -177,15 +179,24 @@ export default async function PortfolioHome({
   // default since 2026-11-09). Missing row = off, matching
   // /api/trade/check, which is watch-only while this is off.
   let autoSellOn = false;
+  // Buys per day (added 2026-11-10, Durkan: buy multiple stocks a
+  // day): trade_settings 'daily_buy_count', integer 1-5, default 1.
+  let dailyBuyCount = 1;
   try {
     await sql`CREATE TABLE IF NOT EXISTS trade_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
     const setting = await sql`SELECT value FROM trade_settings WHERE key = 'human_approval' LIMIT 1`;
     if (setting.length > 0) approvalOn = setting[0].value !== "off";
     const autoSetting = await sql`SELECT value FROM trade_settings WHERE key = 'auto_sell' LIMIT 1`;
     if (autoSetting.length > 0) autoSellOn = autoSetting[0].value === "on";
+    const countSetting = await sql`SELECT value FROM trade_settings WHERE key = 'daily_buy_count' LIMIT 1`;
+    if (countSetting.length > 0) {
+      const n = parseInt(String(countSetting[0].value), 10);
+      if (Number.isFinite(n)) dailyBuyCount = Math.max(1, Math.min(5, n));
+    }
   } catch {
     approvalOn = true;
     autoSellOn = false;
+    dailyBuyCount = 1;
   }
   const pendingProposals = await safe(
     () =>
@@ -193,11 +204,11 @@ export default async function PortfolioHome({
         SELECT id, ticker, leaderboard_rank, score, price_at_proposal, catalyst, catalyst_type, event_date, status, created_at
         FROM trade_proposals
         WHERE status = 'pending' AND DATE(created_at) = CURRENT_DATE
-        ORDER BY created_at DESC LIMIT 1
+        ORDER BY created_at ASC LIMIT 5
       `,
     [] as AnyRow[],
   );
-  const proposal = pendingProposals[0] ?? null;
+  const proposals = pendingProposals;
   const recentProposals = await safe(
     () =>
       sql`
@@ -220,10 +231,19 @@ export default async function PortfolioHome({
     WMT: "Consumer Staples", COST: "Consumer Staples", PG: "Consumer Staples", KO: "Consumer Staples",
     XOM: "Energy", CVX: "Energy", NEE: "Utilities", PLD: "Real Estate", LIN: "Materials",
   };
-  const proposalSector = proposal ? SECTOR[proposal.ticker] : undefined;
-  const sameSectorOpen = proposalSector
-    ? open.filter((t) => SECTOR[t.ticker] === proposalSector).map((t) => t.ticker)
-    : [];
+  // Per-proposal flags (multi-buy: one card renders per pending
+  // proposal, so these are computed per row at render time).
+  const daysToEventFor = (p: AnyRow) => {
+    if (!p || !p.event_date) return null;
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const ev = new Date(p.event_date);
+    return Math.round((ev.getTime() - today.getTime()) / 86400000);
+  };
+  const sameSectorOpenFor = (p: AnyRow) => {
+    const s = SECTOR[p.ticker];
+    return s ? open.filter((t) => SECTOR[t.ticker] === s).map((t) => t.ticker) : [];
+  };
   // Regime breadth (same definition as the daily gate): share of
   // fresh price_cache tickers up on the day. Weak = < 40%, which
   // raises the daily score floor from 50 to 75 for that run only.
@@ -242,13 +262,6 @@ export default async function PortfolioHome({
   const regimeN = Number(regimeRows[0]?.n ?? 0);
   const regimeBreadth = regimeN >= 100 ? Math.round(((Number(regimeRows[0]?.up ?? 0) / regimeN) * 100) * 10) / 10 : null;
   const regimeStatus = regimeBreadth === null ? "data unavailable — gate inactive" : regimeBreadth < 40 ? "weak — daily score floor raised to 75" : "normal — score floor 50";
-  const proposalDaysToEvent = (() => {
-    if (!proposal || !proposal.event_date) return null;
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-    const ev = new Date(proposal.event_date);
-    return Math.round((ev.getTime() - today.getTime()) / 86400000);
-  })();
 
   const openRows = open.map((t) => {
     const entry = num(t.entry_price);
@@ -284,6 +297,18 @@ export default async function PortfolioHome({
     const shares = entry !== null && entry > 0 ? notional / entry : null;
     const plUsd = plPct === null ? null : (plPct / 100) * notional;
     const currentValue = current !== null && shares !== null ? shares * current : null;
+    // Day %: today's change vs yesterday's close, from the
+    // staggered price cache (the 1-day % the quote feeds report —
+    // Finnhub dp, TwelveData percent_change, FMP changesPercentage).
+    // Only a row updated today counts; a stale row from yesterday
+    // is not "today", so it shows "—" until the cache refreshes
+    // (the stagger job runs every 5 minutes).
+    const cacheRow = cacheByTicker.get(t.ticker);
+    const cacheToday = cacheRow
+      ? new Date(cacheRow.updated_at).toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" }) ===
+        new Date().toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" })
+      : false;
+    const dayPct = cacheToday ? num(cacheRow!.change_pct) : null;
     // Tax-reserve (SGOV) rows are the parking vehicle, not a trade:
     // the +3% / -2% levels never apply to them, so show no TP/SL.
     const isReserve = Boolean(t.is_tax_reserve);
@@ -295,7 +320,7 @@ export default async function PortfolioHome({
       .filter((r) => r.ticker === t.ticker && num(r.price) !== null && new Date(r.scanned_at).getTime() >= openedMs)
       .map((r) => num(r.price)!);
     const sparkPoints = spark.length >= 2 ? spark : entry !== null && current !== null ? [entry, current] : spark;
-    return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints, isReserve };
+    return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints, isReserve, dayPct };
   });
 
   // Portfolio value series: at each scan time, sum shares × latest
@@ -427,7 +452,7 @@ export default async function PortfolioHome({
       <div className="hero-label">Portfolio value · Paper only</div>
       <div className="hero-value">${currentTotal.toFixed(2)}</div>
       <div className="hero-pl" style={{ color: plColor(totalPlPct) }}>
-        {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) today / since purchase`}
+        {totalPlPct === null ? "No open positions" : `${totalPlUsd >= 0 ? "+" : "−"}$${Math.abs(totalPlUsd).toFixed(2)} (${totalPlPct >= 0 ? "+" : ""}${totalPlPct.toFixed(2)}%) since purchase`}
       </div>
       <div className="meta">Invested ${invested.toFixed(2)} across {open.length} open position{open.length === 1 ? "" : "s"} · Closed P/L ${closedPlUsd >= 0 ? "+" : "−"}$${Math.abs(closedPlUsd).toFixed(2)}</div>
 
@@ -450,8 +475,8 @@ export default async function PortfolioHome({
         <h2>Trade approval — human in the loop</h2>
         <p className="meta">
           Approval mode is <strong>{approvalOn ? "ON" : "OFF"}</strong>. {approvalOn
-            ? "The daily run proposes a trade and buys nothing until you approve it here."
-            : "The daily run buys directly, as before."}{" "}
+            ? `The daily run proposes up to ${dailyBuyCount} trade${dailyBuyCount === 1 ? "" : "s"} and buys nothing until you approve ${dailyBuyCount === 1 ? "it" : "them"} here.`
+            : `The daily run buys up to ${dailyBuyCount} ticker${dailyBuyCount === 1 ? "" : "s"} directly, as before.`}{" "}
           Sells are manual — a position closes only when you press Sell on it below. Automatic +3% / −2% sells are <strong>{autoSellOn ? "ON" : "OFF"}</strong>.
         </p>
         {!pinConfigured && (
@@ -476,44 +501,69 @@ export default async function PortfolioHome({
           </button>
           <span className="meta" style={{ marginTop: 0 }}>Automatic sells are {autoSellOn ? "ON — the 15-minute check closes at +3% / −2%." : "OFF — sells are manual only, and the 15-minute check only watches the levels."}</span>
         </form>
-        {proposal ? (
-          <div style={{ marginTop: 16, border: "2px solid #0b1f3a", borderRadius: 14, padding: 14 }}>
-            <div style={{ fontSize: 20, fontWeight: 800 }}>{proposal.ticker} — proposed buy, $100</div>
-            <div className="meta">
-              Rank {proposal.leaderboard_rank ?? "—"} · Score {proposal.score ?? "—"} · Price at proposal ${proposal.price_at_proposal ?? "—"}
-              {proposal.catalyst_type ? ` · ${proposal.catalyst_type}` : ""}
-              {proposal.event_date ? ` · Event ${fmtDate(proposal.event_date)}` : ""}
-            </div>
-            <div className="meta">{proposal.catalyst ?? ""}</div>
-            <div className="meta">
-              {proposalDaysToEvent !== null && proposalDaysToEvent <= 1
-                ? "⚠️ Earnings/event in " + proposalDaysToEvent + " day(s) — high event risk: the move can gap straight past the stop. "
-                : ""}
-              {proposalDaysToEvent !== null && proposalDaysToEvent > 1 ? `Event in ${proposalDaysToEvent} days. ` : ""}
-              {sameSectorOpen.length > 0
-                ? `⚠️ Same sector (${proposalSector}) as open position${sameSectorOpen.length === 1 ? "" : "s"}: ${sameSectorOpen.join(", ")} — this would concentrate that sector. `
-                : ""}
-              {Number(proposal.score) < 60 ? "Score is watch-range (< 60), not strong. " : ""}
-              Approval executes at the current market price for $100 notional — the proposal price is a reference, not a limit. Guards are re-checked at approval (score ≥ 50, 1-day fall &gt; −5%); if it now fails, no order is placed.
-            </div>
-            <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
-              <form method="post" action="/api/trade/approve" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <input type="hidden" name="proposalId" value={String(proposal.id)} />
-                <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
-                <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "none", background: "#137333", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
-                  ✓ Approve buy
-                </button>
-              </form>
-              <form method="post" action="/api/trade/reject" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <input type="hidden" name="proposalId" value={String(proposal.id)} />
-                <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
-                <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "1px solid #a50e0e", background: "#fff", color: "#a50e0e", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
-                  ✕ Reject
-                </button>
-              </form>
-            </div>
-            <p className="note">Rejecting is for today only — the ticker stays never-bought and can be proposed again later if it still passes the guards. A proposal expires at the end of the day it was created.</p>
-          </div>
+        <form method="post" action="/api/trade/settings" style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="hidden" name="key" value="daily_buy_count" />
+          <label className="meta" style={{ marginTop: 0 }}>Buys per day:</label>
+          <select name="value" defaultValue={String(dailyBuyCount)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14 }}>
+            {[1, 2, 3, 4, 5].map((n) => (
+              <option key={n} value={String(n)}>{n}</option>
+            ))}
+          </select>
+          <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+          <button type="submit" style={{ padding: "10px 16px", borderRadius: 999, border: "1px solid #0b1f3a", background: "#fff", color: "#0b1f3a", fontSize: 14, cursor: "pointer" }}>
+            Set buys per day
+          </button>
+          <span className="meta" style={{ marginTop: 0 }}>The daily run proposes (or buys) up to this many never-bought tickers, in rank order — $100 each. Default 1.</span>
+        </form>
+        {proposals.length > 0 ? (
+          proposals.map((proposal: AnyRow) => {
+            const d = daysToEventFor(proposal);
+            const sector = SECTOR[proposal.ticker];
+            const sameSector = sameSectorOpenFor(proposal);
+            const isPost = proposal.catalyst_type === "post_earnings";
+            return (
+              <div key={proposal.id} style={{ marginTop: 16, border: "2px solid #0b1f3a", borderRadius: 14, padding: 14 }}>
+                <div style={{ fontSize: 20, fontWeight: 800 }}>{proposal.ticker} — proposed buy, $100</div>
+                <div className="meta">
+                  Rank {proposal.leaderboard_rank ?? "—"} · Score {proposal.score ?? "—"} · Price at proposal ${proposal.price_at_proposal ?? "—"}
+                  {proposal.catalyst_type ? ` · ${proposal.catalyst_type}` : ""}
+                  {proposal.event_date ? ` · ${isPost ? "Reported" : "Event"} ${fmtDate(proposal.event_date)}` : ""}
+                </div>
+                <div className="meta">{proposal.catalyst ?? ""}</div>
+                <div className="meta">
+                  {isPost && d !== null
+                    ? `📉 Reported ${Math.abs(d)} day${Math.abs(d) === 1 ? "" : "s"} ago — post-earnings move: the report is behind it, so the risk is drift after the news, not a gap on the report. `
+                    : ""}
+                  {!isPost && d !== null && d <= 1
+                    ? "⚠️ Earnings/event in " + d + " day(s) — high event risk: the move can gap straight past the stop. "
+                    : ""}
+                  {!isPost && d !== null && d > 1 ? `Event in ${d} days. ` : ""}
+                  {sameSector.length > 0
+                    ? `⚠️ Same sector (${sector}) as open position${sameSector.length === 1 ? "" : "s"}: ${sameSector.join(", ")} — this would concentrate that sector. `
+                    : ""}
+                  {Number(proposal.score) < 60 ? "Score is watch-range (< 60), not strong. " : ""}
+                  Approval executes at the current market price for $100 notional — the proposal price is a reference, not a limit. Guards are re-checked at approval (score ≥ 50, 1-day fall &gt; −5%); if it now fails, no order is placed.
+                </div>
+                <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+                  <form method="post" action="/api/trade/approve" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                    <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+                    <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "none", background: "#137333", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                      ✓ Approve buy
+                    </button>
+                  </form>
+                  <form method="post" action="/api/trade/reject" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <input type="hidden" name="proposalId" value={String(proposal.id)} />
+                    <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+                    <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "1px solid #a50e0e", background: "#fff", color: "#a50e0e", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                      ✕ Reject
+                    </button>
+                  </form>
+                </div>
+                <p className="note">Rejecting is for today only — the ticker stays never-bought and can be proposed again later if it still passes the guards. A proposal expires at the end of the day it was created.</p>
+              </div>
+            );
+          })
         ) : (
           <p className="meta">No trade awaiting approval right now. The next proposal arrives with the next weekday daily run at 06:52 PDT (or with a manual Run now on the daily job).</p>
         )}
@@ -557,7 +607,7 @@ export default async function PortfolioHome({
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Take profit</th><th>Stop loss</th><th>Sell</th></tr>
+                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Day %</th><th>Take profit</th><th>Stop loss</th><th>Sell</th></tr>
               </thead>
               <tbody>
                 {openRows.map((r) => {
@@ -576,6 +626,7 @@ export default async function PortfolioHome({
                       <td>${r.current === null ? "—" : r.current.toFixed(2)}</td>
                       <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plUsd === null ? "—" : `${r.plUsd >= 0 ? "+" : "−"}$${Math.abs(r.plUsd).toFixed(2)}`}</td>
                       <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plPct === null ? "—" : `${r.plPct >= 0 ? "+" : ""}${r.plPct.toFixed(2)}%`}</td>
+                      <td style={{ color: r.dayPct === null || r.dayPct === 0 ? "#5f6368" : r.dayPct > 0 ? "#137333" : "#a50e0e", fontWeight: 700 }}>{r.dayPct === null ? "—" : `${r.dayPct >= 0 ? "+" : ""}${r.dayPct.toFixed(2)}%`}</td>
                       <td>${r.tp === null ? "—" : r.tp.toFixed(2)}</td>
                       <td>${r.sl === null ? "—" : r.sl.toFixed(2)}</td>
                       <td>
@@ -592,7 +643,7 @@ export default async function PortfolioHome({
             </table>
           </div>
         )}
-        <p className="note">Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit. An SGOV row is your parked tax reserve (money market ETF), not a trade — the +3% / −2% levels never apply to it, and selling it is how you withdraw the parked money at tax time.</p>
+        <p className="note">P/L % is since you bought; Day % is today&apos;s change vs yesterday&apos;s close (from the staggered quote cache — &quot;—&quot; if it hasn&apos;t refreshed today). Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit. An SGOV row is your parked tax reserve (money market ETF), not a trade — the +3% / −2% levels never apply to it, and selling it is how you withdraw the parked money at tax time.</p>
       </section>
 
       <section className="card">
