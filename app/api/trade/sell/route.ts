@@ -6,7 +6,7 @@ import { sweepTaxReserve } from "@/lib/taxPark";
 
 // Manual sell: close one open paper position at the current market
 // price, on the user's explicit action in the portfolio home.
-// Paper only, $100 positions, PIN-gated like approve/reject.
+// Paper only, PIN-gated like approve/reject.
 //
 // Auto sells are OFF by choice (2026-11-09, manual only):
 // /api/trade/check no longer sells, it only watches the +3% / -2%
@@ -15,6 +15,16 @@ import { sweepTaxReserve } from "@/lib/taxPark";
 // there is no partial sell. Exit price and P/L come from the live
 // Alpaca position read just before closing, and are recorded in
 // paper_trades + trade_attempts like the automatic closes were.
+//
+// ACCUMULATED LOTS (2026-11-12): ad-hoc buys may add a second
+// (or third) open paper_trades row for a ticker the user already
+// holds. Alpaca holds ONE position per symbol, so selling from
+// any lot's Sell button closes the whole position — and this
+// route now closes ALL open lots of that ticker together, each
+// with its own per-lot P/L ((exit − lot entry) / lot entry, the
+// Alpaca position P/L only as a fallback when a lot has no
+// entry). Each lot keeps its own entry, P/L and tax, so the
+// closed table and the tax reserve stay honest per lot.
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
@@ -76,18 +86,37 @@ export async function POST(req: NextRequest) {
     return homeWith("sell_alpaca_failed", ticker);
   }
 
-  // pnl_pct is stored as a FRACTION (e.g. 0.032), matching
+  // Close ALL open lots of this ticker, not just the tapped row:
+  // Alpaca holds one position per symbol, so closePosition above
+  // already sold every lot. Each lot gets its own per-lot P/L
+  // ((exit − lot entry) / lot entry); the Alpaca position P/L is
+  // only the fallback for a lot with no recorded entry. pnl_pct
+  // is stored as a FRACTION (e.g. 0.032), matching
   // /api/trade/check and the journal's display (pnl * 100 = %).
-  await sql`
-    UPDATE paper_trades
-    SET status = 'closed_manual', exit_price = ${Number.isFinite(exitPrice) ? exitPrice : null},
-        pnl_pct = ${Number.isFinite(plpc) ? plpc : null}, closed_at = NOW()
-    WHERE id = ${trade.id}
+  const lots = await sql`
+    SELECT id, leaderboard_rank, entry_price, notional_usd
+    FROM paper_trades WHERE ticker = ${ticker} AND status = 'open'
+    ORDER BY opened_at ASC
   `;
-  try {
-    await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
-      VALUES ('manual_sell', NULL, ${ticker}, ${trade.leaderboard_rank}, 'sold_manual', ${`manual sell at $${exitPrice}, plpc ${plpc}`})`;
-  } catch { /* logging must not block */ }
+  for (const lot of lots as Array<{ id: number; leaderboard_rank: number | null; entry_price: number | null; notional_usd: number | null }>) {
+    const entry = lot.entry_price === null ? null : Number(lot.entry_price);
+    const lotPnl =
+      entry !== null && entry > 0 && Number.isFinite(exitPrice)
+        ? (exitPrice - entry) / entry
+        : Number.isFinite(plpc)
+          ? plpc
+          : null;
+    await sql`
+      UPDATE paper_trades
+      SET status = 'closed_manual', exit_price = ${Number.isFinite(exitPrice) ? exitPrice : null},
+          pnl_pct = ${lotPnl}, closed_at = NOW()
+      WHERE id = ${lot.id}
+    `;
+    try {
+      await sql`INSERT INTO trade_attempts (job, scan_id, ticker, leaderboard_rank, outcome, detail)
+        VALUES ('manual_sell', NULL, ${ticker}, ${lot.leaderboard_rank}, 'sold_manual', ${`manual sell at $${exitPrice}, lot plpc ${lotPnl}`})`;
+    } catch { /* logging must not block */ }
+  }
   // Tax parking, same buy pattern as a stock buy: if this sale
   // created (or added to) tax owed, sweep the un-parked amount
   // into SGOV (money market ETF) as a real Alpaca paper buy. The

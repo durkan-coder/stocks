@@ -69,6 +69,31 @@ export async function placeNotionalBuy(symbol: string, notional = TRADE_NOTIONAL
   });
 }
 
+// Ad-hoc buy: the user picks the amount (default $100 in the form),
+// so this deliberately does NOT go through the $100 guard above —
+// the daily/approve flow still uses placeNotionalBuy and stays
+// $100. Bounds: at least $1 (Alpaca's fractional minimum) and at
+// most $10,000 (the paper account's capital). A market order, same
+// as an approval: it fills in regular hours and queues for the
+// next session after hours.
+export const ADHOC_BUY_MIN_USD = 1;
+export const ADHOC_BUY_MAX_USD = 10000;
+export async function placeAdhocBuy(symbol: string, notional: number) {
+  if (!Number.isFinite(notional) || notional < ADHOC_BUY_MIN_USD || notional > ADHOC_BUY_MAX_USD) {
+    throw new Error(`Ad-hoc buy amount must be between $${ADHOC_BUY_MIN_USD} and $${ADHOC_BUY_MAX_USD}`);
+  }
+  return alpaca("/v2/orders", {
+    method: "POST",
+    body: JSON.stringify({
+      symbol,
+      notional: String(notional.toFixed(2)),
+      side: "buy",
+      type: "market",
+      time_in_force: "day",
+    }),
+  });
+}
+
 // Tax-park buy: same idea as a stock buy (notional, fractional),
 // but the amount is the tax slice from a sale, not the fixed $100
 // — so it deliberately does NOT go through the $100 guard above.
