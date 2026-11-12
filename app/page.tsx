@@ -659,7 +659,7 @@ export default async function PortfolioHome({
                         <form method="post" action="/api/trade/sell" style={{ display: "flex", gap: 6, alignItems: "center" }}>
                           <input type="hidden" name="tradeId" value={String(r.t.id)} />
                           <input type="password" name="pin" placeholder="PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ccc", fontSize: 13, width: 84 }} />
-                          <button type="submit" style={{ padding: "8px 14px", borderRadius: 999, border: `1px solid ${sellBg}`, background: sellBg, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Sell</button>
+                          <button type="submit" style={{ padding: "8px 14px", borderRadius: 999, border: `1px solid ${sellBg}`, background: sellBg, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>{r.plUsd === null ? "Sell" : `Sell ${r.plUsd >= 0 ? "+" : "−"}$${Math.abs(r.plUsd).toFixed(2)}`}</button>
                         </form>
                       </td>
                     </tr>
