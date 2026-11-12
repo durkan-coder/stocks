@@ -327,6 +327,11 @@ export default async function PortfolioHome({
     return { t, entry, current, plPct, plUsd, source, tp, sl, notional, shares, currentValue, spark: sparkPoints, isReserve, dayPct };
   });
 
+  // Most profitable first: the table is ordered by P/L %
+  // descending, so the biggest winners sit at the top. Rows with
+  // no live price yet (P/L unknown) go last.
+  openRows.sort((a, b) => (b.plPct ?? -Infinity) - (a.plPct ?? -Infinity));
+
   // Portfolio value series: at each scan time, sum shares × latest
   // scan price (carried forward) over positions opened by then.
   const portfolioSeries: { time: any; value: number }[] = [];
@@ -660,7 +665,7 @@ export default async function PortfolioHome({
             </table>
           </div>
         )}
-        <p className="note">P/L % is since you bought; Day % is today&apos;s change vs yesterday&apos;s close (from the staggered quote cache — &quot;—&quot; if it hasn&apos;t refreshed today). Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit. An SGOV row is your parked tax reserve (money market ETF), not a trade — the +3% / −2% levels never apply to it, and selling it is how you withdraw the parked money at tax time.</p>
+        <p className="note">Positions are ordered by P/L % — most profitable first. P/L % is since you bought; Day % is today&apos;s change vs yesterday&apos;s close (from the staggered quote cache — &quot;—&quot; if it hasn&apos;t refreshed today). Sells are manual: press Sell on a position to close the whole thing at the current market price (PIN required). The +3% take-profit / −2% stop-loss levels are still your targets — the 15-minute check watches them and records when one is hit, but sells nothing while automatic sells are OFF. A gap at the open can move past a level before you sell — the levels guide, but do not guarantee, the exit. An SGOV row is your parked tax reserve (money market ETF), not a trade — the +3% / −2% levels never apply to it, and selling it is how you withdraw the parked money at tax time.</p>
       </section>
 
       <section className="card">
