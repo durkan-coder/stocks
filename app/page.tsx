@@ -94,6 +94,10 @@ export default async function PortfolioHome({
     expired: `${noticeTicker} proposal had expired (not from today), so nothing was bought.`,
     already_decided: `${noticeTicker} proposal was already decided, so nothing changed.`,
     already_bought: `${noticeTicker} was already bought before, so no duplicate order was placed.`,
+    adhoc_bought: `✓ ${noticeTicker} bought ad-hoc — $100 at the current market price. It now shows as an open position below, with the same +3% / −2% levels.`,
+    adhoc_failed: `✕ ${noticeTicker} was not bought — Alpaca rejected the order. Nothing was changed; try again later or during market hours.`,
+    buy_invalid: "No valid ticker was given — type a stock symbol (e.g. NVDA) and try again.",
+    already_open: `${noticeTicker} is already an open position — sell it first if you want to re-enter, or pick another ticker.`,
     no_proposal: "No pending proposal was found for that action — nothing was changed.",
     settings_on: "Approval mode turned ON — the daily run will propose a trade and buy nothing until you approve it.",
     settings_off: "Approval mode turned OFF — the daily run will buy directly, as before.",
@@ -112,7 +116,7 @@ export default async function PortfolioHome({
     tax_park_failed: "✕ The tax park buy was not placed — Alpaca did not accept the order. The amount stays awaiting parking; try again later or during market hours.",
   };
   const notice = noticeRaw && noticeText[noticeRaw] ? noticeText[noticeRaw] : null;
-  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing" || noticeRaw === "settings_daily_count";
+  const noticeOk = noticeRaw === "approved" || noticeRaw === "rejected" || noticeRaw === "adhoc_bought" || noticeRaw === "settings_on" || noticeRaw === "settings_off" || noticeRaw === "sold_manual" || noticeRaw === "settings_auto_sell_on" || noticeRaw === "settings_auto_sell_off" || noticeRaw === "tax_parked" || noticeRaw === "tax_park_nothing" || noticeRaw === "settings_daily_count";
   // The tax-reserve column may not exist yet on the first load after
   // deploy; create it before the SELECT below, or the SELECT fails
   // and the whole portfolio renders empty.
@@ -572,6 +576,19 @@ export default async function PortfolioHome({
             Recent proposals: {recentProposals.map((r: any) => `${r.ticker} (${r.status})`).join(" · ")}
           </div>
         )}
+      </section>
+
+      <section className="card">
+        <h2>Buy a stock now</h2>
+        <p className="meta">Buy $100 of any ticker on the spot — paper only, at the current market price. This is your call, not the scanner&apos;s: no score guard, no daily cap, and it works for tickers outside the leaderboard too. A ticker you already hold open can&apos;t be bought again here — sell it first if you want to re-enter.</p>
+        <form method="post" action="/api/trade/buy" style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="text" name="ticker" placeholder="Ticker, e.g. NVDA" autoComplete="off" autoCapitalize="characters" spellCheck={false} required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 160, textTransform: "uppercase" }} />
+          <input type="password" name="pin" placeholder="Approval PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ccc", fontSize: 14, width: 140 }} />
+          <button type="submit" style={{ padding: "12px 20px", borderRadius: 999, border: "none", background: "#137333", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+            Buy $100 now
+          </button>
+        </form>
+        <p className="note">The buy executes at the current market price — the ticker you type is what gets bought, so double-check it before tapping. Once open, the usual +3% take-profit / −2% stop-loss levels apply, and sells stay manual.</p>
       </section>
 
       <section className="card">
