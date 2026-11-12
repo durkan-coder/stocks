@@ -629,15 +629,21 @@ export default async function PortfolioHome({
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th className="ticker">Stock</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>P/L $</th><th>P/L %</th><th>Day %</th><th>Take profit</th><th>Stop loss</th><th>Sell</th></tr>
+                <tr><th className="ticker">Stock</th><th>Profit $</th><th>P/L %</th><th>Trend</th><th>Shares</th><th>Entry</th><th>Price</th><th>Day %</th><th>Take profit</th><th>Stop loss</th><th>Sell</th></tr>
               </thead>
               <tbody>
                 {openRows.map((r) => {
                   const spark = chartPaths(r.spark, 100, 32, 2);
                   const sparkColor = (r.plPct ?? 0) >= 0 ? "#137333" : "#a50e0e";
+                  // Sell button is green when the position is in profit
+                  // (selling to take the profit) and red when it is at a
+                  // loss (selling to cut the loss) — a quick visual cue.
+                  const sellBg = (r.plPct ?? 0) > 0 ? "#137333" : "#a50e0e";
                   return (
                     <tr key={`${r.t.ticker}-${r.t.id}`}>
                       <td className="ticker">{r.t.ticker}<div className="meta" style={{ marginTop: 0 }}>{r.isReserve ? "Money market — tax reserve" : r.source}</div></td>
+                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plUsd === null ? "—" : `${r.plUsd >= 0 ? "+" : "−"}$${Math.abs(r.plUsd).toFixed(2)}`}</td>
+                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plPct === null ? "—" : `${r.plPct >= 0 ? "+" : ""}${r.plPct.toFixed(2)}%`}</td>
                       <td>
                         {r.spark.length >= 2 ? (
                           <svg viewBox="0 0 100 32" width="100" height="32"><path d={spark.line} fill="none" stroke={sparkColor} strokeWidth="2" strokeLinejoin="round" /></svg>
@@ -646,8 +652,6 @@ export default async function PortfolioHome({
                       <td>{r.shares === null ? "—" : r.shares.toFixed(4)}</td>
                       <td>${r.entry === null ? "—" : r.entry.toFixed(2)}</td>
                       <td>${r.current === null ? "—" : r.current.toFixed(2)}</td>
-                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plUsd === null ? "—" : `${r.plUsd >= 0 ? "+" : "−"}$${Math.abs(r.plUsd).toFixed(2)}`}</td>
-                      <td style={{ color: plColor(r.plPct), fontWeight: 700 }}>{r.plPct === null ? "—" : `${r.plPct >= 0 ? "+" : ""}${r.plPct.toFixed(2)}%`}</td>
                       <td style={{ color: r.dayPct === null || r.dayPct === 0 ? "#5f6368" : r.dayPct > 0 ? "#137333" : "#a50e0e", fontWeight: 700 }}>{r.dayPct === null ? "—" : `${r.dayPct >= 0 ? "+" : ""}${r.dayPct.toFixed(2)}%`}</td>
                       <td>${r.tp === null ? "—" : r.tp.toFixed(2)}</td>
                       <td>${r.sl === null ? "—" : r.sl.toFixed(2)}</td>
@@ -655,7 +659,7 @@ export default async function PortfolioHome({
                         <form method="post" action="/api/trade/sell" style={{ display: "flex", gap: 6, alignItems: "center" }}>
                           <input type="hidden" name="tradeId" value={String(r.t.id)} />
                           <input type="password" name="pin" placeholder="PIN" autoComplete="off" inputMode="numeric" required style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ccc", fontSize: 13, width: 84 }} />
-                          <button type="submit" style={{ padding: "8px 14px", borderRadius: 999, border: "1px solid #a50e0e", background: "#a50e0e", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Sell</button>
+                          <button type="submit" style={{ padding: "8px 14px", borderRadius: 999, border: `1px solid ${sellBg}`, background: sellBg, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>Sell</button>
                         </form>
                       </td>
                     </tr>
