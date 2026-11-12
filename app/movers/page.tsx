@@ -6,8 +6,9 @@
 // spots the pattern in what was missed (a catalyst type, a sector,
 // a timing gap), and tells Muse what logic to adjust — no
 // automatic reweighting, no silent threshold changes. The sweep
-// itself runs once a day after the close (/api/movers/daily,
-// 13:15 PT); this page only reads what it wrote.
+// itself runs twice a day — midday (11:00 PT, /api/movers/midday)
+// and after the close (13:15 PT, /api/movers/daily); this page
+// only reads what they wrote.
 import { neon } from "@neondatabase/serverless";
 import Tabs from "../components/Tabs";
 
@@ -107,7 +108,7 @@ export default async function Page({
       <p className="back"><a href="/scanner">← Scanner</a> · <a href="/">Portfolio</a></p>
       <h1>Missed movers — ≥5% a day</h1>
       <p className="subtitle">
-        Every SPY name that moved 5% or more in a day, from the after-close sweep (13:15 PT). Kept in Postgres for 30 days. Review weekly, adjust the logic by hand.
+        Every SPY name that moved 5% or more in a day, from the midday (11:00 PT) and after-close (13:15 PT) sweeps. Kept in Postgres for 30 days. Review weekly, adjust the logic by hand.
       </p>
       <Tabs
         tabs={[
@@ -140,7 +141,7 @@ export default async function Page({
       {rows.length === 0 ? (
         <section className="section">
           <h2>No runs yet</h2>
-          <p className="section-note">The sweep runs once a day after the close (13:15 PT, cron-job.org → POST /api/movers/daily). Until its first run this page stays honestly empty — the first rows appear the morning after the first run.</p>
+          <p className="section-note">The sweeps run twice a day — midday (11:00 PT, cron-job.org → POST /api/movers/midday) and after the close (13:15 PT, cron-job.org → POST /api/movers/daily). Until the first run this page stays honestly empty — the first rows appear the morning after the first run.</p>
         </section>
       ) : (
         visibleDates.map(({ date, dayRows, shown }) => {

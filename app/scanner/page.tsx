@@ -157,7 +157,8 @@ async function getData() {
       `,
     [] as AnyRow[],
   );
-  // Missed movers (written daily after close by /api/movers/daily):
+  // Missed movers (written by the midday 11:00 PT and after-close
+  // 13:15 PT sweeps, /api/movers/midday and /api/movers/daily):
   // SPY names that moved >= 5% today, with whether the scanner had
   // them on the board and the reason for the move.
   const missedMovers = await safe(
@@ -416,10 +417,10 @@ export default async function Page() {
 
       <section className="section">
         <h2>Missed movers — ≥5% today</h2>
-        <p className="section-note">Every SPY name that moved 5% or more today, from the after-close /api/movers/daily sweep of the staggered price cache. “Missed” means it was on none of today’s shortlist, leaderboard, open positions or proposals — the names the scanner never saw. “On board” means the scanner had it (whether or not it was bought). The reason is the top company-news headline plus any earnings in the last 7 days, quoted verbatim — never invented. If no news and no recent earnings were found, it says so instead of guessing.</p>
+        <p className="section-note">Every SPY name that moved 5% or more today, from the midday (11:00 PT) and after-close (13:15 PT) sweeps of the staggered price cache. “Missed” means it was on none of today’s shortlist, leaderboard, open positions or proposals — the names the scanner never saw. “On board” means the scanner had it (whether or not it was bought). The reason is the top company-news headline plus any earnings in the last 7 days, quoted verbatim — never invented. If no news and no recent earnings were found, it says so instead of guessing.</p>
         <p className="meta"><a href="/movers">Full 30-day history and weekly review →</a></p>
         {missedMovers.length === 0 ? (
-          <p>No missed-movers run yet. The sweep runs once a day after the close (13:15 PT) — see /api/movers/daily. Until its first run this section stays honestly empty.</p>
+          <p>No missed-movers run yet. The sweeps run twice a day — midday (11:00 PT, /api/movers/midday) and after the close (13:15 PT, /api/movers/daily). Until the first run this section stays honestly empty.</p>
         ) : (
           <div className="cards">
             {missedMovers.map((m: any, i: number) => {
